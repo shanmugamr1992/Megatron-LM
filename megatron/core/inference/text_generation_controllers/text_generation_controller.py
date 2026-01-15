@@ -24,7 +24,14 @@ from megatron.core.inference.inference_request import InferenceRequest, Status
 from megatron.core.inference.model_inference_wrappers.abstract_model_inference_wrapper import (
     AbstractModelInferenceWrapper,
 )
-from megatron.core.inference.sampling_params import SamplingParams
+from megatron.core.inference.sampling_params import SamplingParams, SpeculativeConfig
+from megatron.core.inference.speculative_context_helper import (
+    SpeculativeContextState,
+    add_speculative_tokens_to_context,
+    accept_speculative_tokens_in_context,
+    restore_context_after_failed_speculation,
+)
+from megatron.core.inference.speculative_decoding import MTPSpeculativeDecoder
 from megatron.core.inference.utils import get_attention_mask, set_decode_expert_padding
 from megatron.core.transformer.enums import CudaGraphScope
 from megatron.core.transformer.moe.moe_layer import BaseMoELayer
@@ -78,6 +85,11 @@ class TextGenerationController:
         if self.inference_wrapped_model.inference_context.is_dynamic_batching():
             self._init_dynamic_sampling_tensors()
 
+        # Initialize speculative decoding state
+        self._speculative_decoder: Optional[MTPSpeculativeDecoder] = None
+        self._speculative_config: Optional[SpeculativeConfig] = None
+        self._speculative_context_state: Optional[SpeculativeContextState] = None
+
     def set_stop_word_finished_ids_callback(self, callback):
         """Set a callback to get request IDs that should be marked as finished due to stop words.
 
@@ -88,6 +100,28 @@ class TextGenerationController:
             callback: Function that returns request IDs to mark as finished.
         """
         self._get_stop_word_finished_ids_callback = callback
+
+    # PIPELINE PARALLEISM ? 
+    def initialize_speculative_decoding(self, speculative_config: SpeculativeConfig) -> None:
+        """Initialize speculative decoding with the given configuration.
+
+        Args:
+            speculative_config: Configuration for speculative decoding
+        """
+        from megatron.core.inference.speculative_decoding import create_speculative_decoder
+
+        model = self.inference_wrapped_model.model
+        self._speculative_decoder = create_speculative_decoder(model, speculative_config)
+        self._speculative_config = speculative_config
+        self._speculative_context_state = SpeculativeContextState()
+
+    def is_speculative_decoding_enabled(self) -> bool:
+        """Check if speculative decoding is enabled.
+
+        Returns:
+            True if speculative decoding is initialized and active
+        """
+        return self._speculative_decoder is not None
 
     def _init_dynamic_sampling_tensors(self):
         """Initialize tensors needed for dynamic sampling."""
@@ -859,6 +893,64 @@ class TextGenerationController:
             "finished_request_ids": finished_request_ids,
         }
 
+    def _speculative_draft_step(self, mtp_logits_list: List[Tensor]) -> Tuple[Tensor, Tensor]:
+        """Generate draft tokens using MTP logits.
+
+        Args:
+            mtp_logits_list: List of logits from MTP layers
+
+        Returns:
+            draft_tokens: Tensor of drafted tokens [batch, num_speculative_tokens]
+            draft_probs: Tensor of draft probabilities [batch, num_speculative_tokens]
+        """
+        assert self._speculative_decoder is not None
+        context = self.inference_wrapped_model.inference_context
+        active_request_slice = slice(context.paused_request_count, context.total_request_count)
+
+        # Get sampling parameters for the active requests
+        # For simplicity, use greedy drafting (top_k=1) or the first request's params
+        temp = self._request_metadata["temperature"][active_request_slice][0].item()
+        top_k = int(self._request_metadata["top_k"][active_request_slice][0].item())
+        top_p = self._request_metadata["top_p"][active_request_slice][0].item()
+
+        return self._speculative_decoder.draft_tokens_from_mtp_logits(
+            mtp_logits_list,
+            temperature=temp,
+            top_k=top_k,
+            top_p=top_p,
+            generator=self.sampling_rng,
+        )
+
+    def _speculative_verify_step(
+        self, 
+        draft_tokens: Tensor, 
+        draft_probs: Tensor, 
+        target_logits: Tensor
+    ) -> Tuple[Tensor, Tensor, Tensor]:
+        """Verify draft tokens against target model.
+
+        Args:
+            draft_tokens: Tensor of drafted tokens [batch, num_speculative_tokens]
+            draft_probs: Tensor of draft probabilities [batch, num_speculative_tokens]
+            target_logits: Tensor of target model logits [batch, num_speculative_tokens + 1, vocab_size]
+
+        Returns:
+            accepted_tokens: Final accepted tokens
+            num_accepted: Number of accepted tokens per request
+            acceptance_mask: Boolean mask of accepted drafts
+        """
+        assert self._speculative_decoder is not None
+
+        acceptance_threshold = self._speculative_config.acceptance_threshold
+
+        return self._speculative_decoder.verify_and_accept(
+            draft_tokens,
+            draft_probs,
+            target_logits,
+            acceptance_threshold=acceptance_threshold,
+            generator=self.sampling_rng,
+        )
+
     @torch.inference_mode()
     async def async_generate_output_tokens_dynamic_batch(
         self, skip_bookkeeping: Optional[bool] = False
@@ -924,6 +1016,306 @@ class TextGenerationController:
             "log_probs": log_probs,
             "top_n_logprobs": top_n_logprobs,
             "cuda_graph_request_count": cuda_graph_request_count,
+        }
+        ret.update(request_bookkeeping)
+        return ret
+
+    @torch.inference_mode()
+    async def async_generate_output_tokens_dynamic_batch_speculative(
+        self, skip_bookkeeping: Optional[bool] = False
+    ) -> Optional[Dict]:
+        """Forward step with speculative decoding using MTP heads.
+
+        This method implements the speculative decoding loop:
+        1. If in decode mode and not verification step:
+           - Run forward to get main logits and MTP logits
+           - Draft tokens from MTP logits
+           - Store draft tokens for verification in next step
+           - Add draft tokens to context for next forward pass
+        2. If verification step:
+           - Run forward on draft tokens to get verification logits
+           - Verify and accept/reject draft tokens
+           - Update context with accepted tokens
+
+        Args:
+            skip_bookkeeping (Optional[bool]): If true, skip the context bookkeeping step.
+
+        Return:
+            (Optional[Dict]): Same return type as async_generate_output_tokens_dynamic_batch
+        """
+        context = self.inference_wrapped_model.inference_context
+        active_request_count = context.total_request_count - context.paused_request_count
+
+        # No tokens?
+        if context.active_token_count == 0:
+            return None
+
+        # Check if speculative decoding should be used
+        use_speculative = (
+            self.is_speculative_decoding_enabled()
+            and context.is_decode_only()
+            and active_request_count > 0
+        )
+
+        if not use_speculative:
+            # Fall back to regular generation
+            return await self.async_generate_output_tokens_dynamic_batch(skip_bookkeeping)
+
+        state = self._speculative_context_state
+        assert state is not None
+
+        # Check if this is a verification step
+        if state.is_verification_step and state.draft_tokens is not None:
+            # Verification step: verify the draft tokens
+            return await self._speculative_verification_step(skip_bookkeeping)
+        else:
+            # Draft step: generate draft tokens and prepare for verification
+            return await self._speculative_draft_and_prepare_step(skip_bookkeeping)
+
+    async def _speculative_draft_and_prepare_step(
+        self, skip_bookkeeping: bool
+    ) -> Optional[Dict]:
+        """Execute the draft phase of speculative decoding.
+
+        Runs a forward pass to get both main logits and MTP logits,
+        then uses MTP logits to draft tokens.
+
+        Args:
+            skip_bookkeeping: Whether to skip bookkeeping
+
+        Returns:
+            Dictionary with generation results including draft info
+        """
+        context = self.inference_wrapped_model.inference_context
+        active_request_count = context.total_request_count - context.paused_request_count
+        active_request_slice = slice(context.paused_request_count, context.total_request_count)
+        state = self._speculative_context_state
+        assert state is not None
+
+        input_ids, position_ids = self._dynamic_step_context_init()
+
+        cuda_graph_request_count = (
+            context.padded_active_request_count if context.is_decode_only() else None
+        )
+
+        # Run forward pass with MTP logits enabled
+        # The model wrapper needs to be configured to return MTP logits
+        with torch.inference_mode():
+            output = self.inference_wrapped_model.run_one_forward_step(
+                {"tokens": input_ids, "position_ids": position_ids, "attention_mask": None}
+            )
+
+        # Check if model returned MTP logits
+        # Dimensions : 
+        # Logits : [1, logits_seq_len, vocab_size]
+        # mtp_logits_list : List[Tensor] of length num_mtp_heads, and each tensor is of shape [1, logits_seq_len, vocab_size]. So mtp_logits_list[i] is the logits for the ith token across all inputs
+        if isinstance(output, tuple) and len(output) == 2:
+            logits, mtp_logits_list = output
+        else:
+            logits = output
+            mtp_logits_list = None
+
+        # Broadcast logits if pipeline parallel
+        if self.model_is_pipeline_parallel:
+            inference_wrapper_config = self.inference_wrapped_model.inference_wrapper_config
+            logits_seq_len = (
+                active_request_count
+                if context.materialize_only_last_token_logits
+                else input_ids.shape[1]
+            )
+            vocab_size = inference_wrapper_config.padded_vocab_size
+            logits_shape = [1, logits_seq_len, vocab_size]
+
+            if is_pipeline_last_stage(self.pp_group):
+                assert logits is not None and torch.Size(logits_shape) == logits.shape
+
+            logits = broadcast_from_last_pipeline_stage(
+                logits_shape,
+                dtype=inference_wrapper_config.params_dtype,
+                tensor=logits,
+                pp_group=self.pp_group,
+            )
+
+        await asyncio.sleep(0)
+
+        # If MTP logits available, draft tokens
+        if mtp_logits_list is not None and len(mtp_logits_list) > 0:
+            num_speculative = min(
+                self._speculative_config.num_speculative_tokens,
+                len(mtp_logits_list)
+            )
+
+            # Use only the required number of MTP layers
+            mtp_logits_subset = mtp_logits_list[:num_speculative]
+
+            # Draft tokens
+            draft_tokens, draft_probs = self._speculative_draft_step(mtp_logits_subset)
+
+            # Add draft tokens to context for verification forward pass
+            # This prepares the KV cache positions for the draft tokens
+            updated_state = add_speculative_tokens_to_context(
+                context, draft_tokens, draft_probs, state
+            )
+            if updated_state is None:
+                # Failed to add speculative tokens, fall back to regular generation
+                return await self.async_generate_output_tokens_dynamic_batch(skip_bookkeeping)
+
+            # Return the first token (from main logits) as the sample for this step
+            return_log_probs, return_top_n_logprobs = self._dynamic_step_log_probs_bookkeeping()
+            self._dynamic_step_sample_bookkeeping()
+            self._dynamic_step_sample_logits(logits)
+
+            log_probs = None
+            top_n_logprobs = None
+            if return_log_probs or return_top_n_logprobs:
+                log_probs, log_probs_tensor = self._dynamic_step_calculate_log_probs(logits)
+                if return_top_n_logprobs:
+                    top_n_logprobs = self._dynamic_step_calculate_top_n_logprobs(
+                        logits, log_probs_tensor
+                    )
+
+            # Skip bookkeeping - we'll do it in verification step
+            ret = {
+                "sample": self._sampled_tokens_cuda[:active_request_count],
+                "log_probs": log_probs,
+                "top_n_logprobs": top_n_logprobs,
+                "cuda_graph_request_count": cuda_graph_request_count,
+                "speculative_draft_tokens": draft_tokens,
+                "is_speculative_draft": True,
+            }
+            return ret
+
+        else:
+            # No MTP logits available, fall back to regular sampling
+            return_log_probs, return_top_n_logprobs = self._dynamic_step_log_probs_bookkeeping()
+            self._dynamic_step_sample_bookkeeping()
+            self._dynamic_step_sample_logits(logits)
+
+            log_probs = None
+            top_n_logprobs = None
+            if return_log_probs or return_top_n_logprobs:
+                log_probs, log_probs_tensor = self._dynamic_step_calculate_log_probs(logits)
+                if return_top_n_logprobs:
+                    top_n_logprobs = self._dynamic_step_calculate_top_n_logprobs(
+                        logits, log_probs_tensor
+                    )
+
+            if skip_bookkeeping:
+                request_bookkeeping = {}
+            else:
+                request_bookkeeping = self._dynamic_step_context_bookkeeping()
+
+            ret = {
+                "sample": self._sampled_tokens_cuda[:active_request_count],
+                "log_probs": log_probs,
+                "top_n_logprobs": top_n_logprobs,
+                "cuda_graph_request_count": cuda_graph_request_count,
+            }
+            ret.update(request_bookkeeping)
+            return ret
+
+    async def _speculative_verification_step(
+        self, skip_bookkeeping: bool
+    ) -> Optional[Dict]:
+        """Execute the verification phase of speculative decoding.
+
+        Runs forward pass on draft tokens and verifies them against target distribution.
+
+        Args:
+            skip_bookkeeping: Whether to skip bookkeeping
+
+        Returns:
+            Dictionary with generation results including accepted tokens
+        """
+        context = self.inference_wrapped_model.inference_context
+        active_request_count = context.total_request_count - context.paused_request_count
+        state = self._speculative_context_state
+        assert state is not None
+
+        draft_tokens = state.draft_tokens
+        draft_probs = state.draft_probs
+        assert draft_tokens is not None and draft_probs is not None
+
+        # Get input for verification (includes draft tokens)
+        input_ids, position_ids = self._dynamic_step_context_init()
+
+        cuda_graph_request_count = (
+            context.padded_active_request_count if context.is_decode_only() else None
+        )
+
+        # Run verification forward pass
+        with torch.inference_mode():
+            logits = self.inference_wrapped_model.run_one_forward_step(
+                {"tokens": input_ids, "position_ids": position_ids, "attention_mask": None}
+            )
+
+        # Handle tuple output (in case model still returns MTP logits)
+        if isinstance(logits, tuple):
+            logits = logits[0]
+
+        # Broadcast logits if pipeline parallel
+        if self.model_is_pipeline_parallel:
+            inference_wrapper_config = self.inference_wrapped_model.inference_wrapper_config
+            num_draft_tokens = draft_tokens.shape[1]
+            logits_seq_len = num_draft_tokens + 1  # draft tokens + original last token
+            vocab_size = inference_wrapper_config.padded_vocab_size
+            logits_shape = [1, logits_seq_len, vocab_size]
+
+            if is_pipeline_last_stage(self.pp_group):
+                assert logits is not None
+
+            logits = broadcast_from_last_pipeline_stage(
+                logits_shape,
+                dtype=inference_wrapper_config.params_dtype,
+                tensor=logits,
+                pp_group=self.pp_group,
+            )
+
+        await asyncio.sleep(0)
+
+        # Verify draft tokens
+        accepted_tokens, num_accepted, acceptance_mask = self._speculative_verify_step(
+            draft_tokens, draft_probs, logits
+        )
+
+        # Update sampled tokens buffer with accepted tokens
+        # num_accepted includes the newly sampled token at rejection point
+        for b in range(active_request_count):
+            n = int(num_accepted[b].item())
+            self._sampled_tokens_cuda[b] = accepted_tokens[b, n - 1]  # Last accepted token
+
+        # Update context with all accepted tokens
+        accept_speculative_tokens_in_context(context, accepted_tokens, num_accepted, state)
+
+        # Compute log probs if requested
+        return_log_probs, return_top_n_logprobs = self._dynamic_step_log_probs_bookkeeping()
+        log_probs = None
+        top_n_logprobs = None
+        if return_log_probs or return_top_n_logprobs:
+            # Get log probs for the last accepted token
+            # Use the logits at the position of acceptance
+            log_probs_list = []
+            for b in range(active_request_count):
+                n = int(num_accepted[b].item())
+                token = accepted_tokens[b, n - 1]
+                pos_logits = logits[0, n - 1] if logits.dim() == 3 else logits[b]
+                log_prob = F.log_softmax(pos_logits, dim=-1)[token].item()
+                log_probs_list.append(log_prob)
+            log_probs = log_probs_list
+
+        if skip_bookkeeping:
+            request_bookkeeping = {}
+        else:
+            request_bookkeeping = self._dynamic_step_context_bookkeeping()
+
+        ret = {
+            "sample": self._sampled_tokens_cuda[:active_request_count],
+            "log_probs": log_probs,
+            "top_n_logprobs": top_n_logprobs,
+            "cuda_graph_request_count": cuda_graph_request_count,
+            "num_accepted_tokens": num_accepted,
+            "accepted_tokens": accepted_tokens,
+            "is_speculative_verify": True,
         }
         ret.update(request_bookkeeping)
         return ret

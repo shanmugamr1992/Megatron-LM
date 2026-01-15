@@ -8,6 +8,8 @@ import os
 import pickle
 import sys
 import warnings
+from megatron.core.inference.speculative_utils import add_speculative_args_to_parser, get_speculative_config_from_args, setup_speculative_decoding
+
 import torch
 from argparse import ArgumentParser
 from collections import defaultdict
@@ -67,6 +69,7 @@ def add_dynamic_inference_args(parser: ArgumentParser) -> ArgumentParser:
     """Dynamic inference arguments."""
 
     add_common_inference_args(parser)
+    add_speculative_args_to_parser(parser)
 
     group = parser.add_argument_group(title='Dynamic inference')
     group.add_argument(
@@ -450,6 +453,11 @@ def main():
         stop_words=args.stop_words,
     ) 
 
+    # Speculative decoding config.
+    speculative_config = get_speculative_config_from_args(args)
+    if speculative_config is not None:
+        sampling_params.speculative_config = speculative_config
+
     model = get_model()
 
     mamba_inference_state_config = get_mamba_inference_state_config_from_model(model)
@@ -462,7 +470,9 @@ def main():
         mamba_inference_state_config=mamba_inference_state_config,
     )
     controller = get_inference_controller(model, context)
-
+    if speculative_config is not None:
+        setup_speculative_decoding(controller, speculative_config)
+        
     # Validate all context_length's <= max_tokens.
     if args.disable_chunked_prefill:
         invalid_prompt_length_map = {}
