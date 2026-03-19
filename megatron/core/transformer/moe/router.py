@@ -583,7 +583,7 @@ class TopKRouter(Router):
                     routing_map = routing_map & (~padding_mask)
                 self.local_tokens_per_expert += routing_map.sum(dim=0)
 
-    def routing(self, logits: torch.Tensor, padding_mask: Optional[torch.Tensor] = None):
+    def routing(self, logits: torch.Tensor, padding_mask: Optional[torch.Tensor] = None, topk_routing_replay_indices: Optional[torch.Tensor] = None):
         """Top-k routing function
 
         Args:
@@ -591,6 +591,9 @@ class TopKRouter(Router):
             padding_mask (torch.Tensor, optional): Boolean mask indicating non-padding tokens.
                                                    Shape [seq_length, bsz]. True for valid tokens,
                                                    False for padding tokens. Defaults to None.
+            topk_routing_replay_indices (torch.Tensor, optional): Pre-determined top-k indices
+                for replay. Shape [num_tokens, num_moe_layers, topk] or [num_tokens, topk].
+                Defaults to None.
 
         Returns:
             probs (torch.Tensor): The probabilities of token to experts assignment.
@@ -607,6 +610,11 @@ class TopKRouter(Router):
         # Apply Z-Loss
         logits = self.apply_z_loss(logits, padding_mask=padding_mask)
 
+        # Slice replay indices for this layer if provided
+        if topk_routing_replay_indices is not None:
+            if topk_routing_replay_indices.dim() == 3:
+                topk_routing_replay_indices = topk_routing_replay_indices[:, self.moe_layer_idx, :]
+
         # Calculate probs and routing_map for token dispatching
         if self.routing_type == "sinkhorn":
             probs, routing_map = self.sinkhorn_load_balancing(logits)
@@ -622,6 +630,7 @@ class TopKRouter(Router):
                 expert_bias=self.expert_bias,
                 fused=self.config.moe_router_fusion,
                 router_replay=self.router_replay,
+                topk_routing_replay_indices=topk_routing_replay_indices,
             )
 
         # Apply token dropping to probs and routing_map.
@@ -677,7 +686,7 @@ class TopKRouter(Router):
             self.global_tokens_per_expert.zero_()
             self.ga_steps.zero_()
 
-    def forward(self, input: torch.Tensor, padding_mask: Optional[torch.Tensor] = None):
+    def forward(self, input: torch.Tensor, padding_mask: Optional[torch.Tensor] = None, moe_topk_routing_replay_indices=None):
         """
         Forward pass of the router.
 
@@ -686,6 +695,8 @@ class TopKRouter(Router):
             padding_mask (torch.Tensor, optional): Boolean mask indicating non-padding tokens.
                                                    Shape [seq_length, bsz]. True for valid tokens,
                                                    False for padding tokens. Defaults to None.
+            moe_topk_routing_replay_indices: Pre-determined top-k indices for replay.
+                                             Defaults to None.
         """
         self._maintain_float32_expert_bias()
 
@@ -697,7 +708,7 @@ class TopKRouter(Router):
             # Apply force load balancing with random logits for benchmark
             logits = apply_random_logits(logits)
 
-        probs, routing_map = self.routing(logits, padding_mask=padding_mask)
+        probs, routing_map = self.routing(logits, padding_mask=padding_mask, topk_routing_replay_indices=moe_topk_routing_replay_indices)
 
         return probs, routing_map
 

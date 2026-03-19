@@ -666,6 +666,7 @@ class TransformerBlock(GraphableMegatronModule, MegatronModule):
         sequence_len_offset: Optional[Tensor] = None,
         padding_mask: Optional[Tensor] = None,
         extract_layer_indices: Optional[Set[int]] = None,
+        moe_topk_routing_replay_indices: Optional[Tensor] = None,
         *,
         inference_params: Optional[BaseInferenceContext] = None,
         dynamic_inference_decode_only: Optional[bool] = None,
@@ -841,6 +842,7 @@ class TransformerBlock(GraphableMegatronModule, MegatronModule):
                             packed_seq_params=packed_seq_params,
                             sequence_len_offset=sequence_len_offset,
                             padding_mask=padding_mask,
+                            moe_topk_routing_replay_indices=moe_topk_routing_replay_indices,
                         )
 
                     if (

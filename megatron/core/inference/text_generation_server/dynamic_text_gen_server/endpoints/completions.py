@@ -216,6 +216,7 @@ try:
                 cache_key = {"block_cache_key": result["routing_block_store_key"]}
                 choices[-1]["moe_topk_indices"] = cache_key
                 choices[-1]["prompt_moe_topk_indices"] = cache_key
+                choices[-1]["generation_moe_topk_indices"] = cache_key
             elif result["routing_indices"] is not None:
                 choices[-1]["moe_topk_indices"] = result["routing_indices"]
                 prompt_length = (
@@ -225,6 +226,15 @@ try:
                     choices[-1]["prompt_moe_topk_indices"] = result["routing_indices"][
                         :prompt_length
                     ]
+                    choices[-1]["generation_moe_topk_indices"] = result["routing_indices"][
+                        prompt_length:
+                    ]
+            routing_indices = result.get("routing_indices")
+            if routing_indices is not None and hasattr(routing_indices, "shape") and len(routing_indices.shape) == 3:
+                choices[-1]["moe_metadata"] = {
+                    "num_moe_layers": int(routing_indices.shape[1]),
+                    "topk": int(routing_indices.shape[2]),
+                }
 
             request_idx += 1
 

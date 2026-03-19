@@ -497,12 +497,32 @@ try:
                 cache_key = {"block_cache_key": result["routing_block_store_key"]}
                 choice_data["moe_topk_indices"] = cache_key
                 choice_data["prompt_moe_topk_indices"] = cache_key
+                choice_data["generation_moe_topk_indices"] = cache_key
             elif result["routing_indices"] is not None:
                 choice_data["moe_topk_indices"] = result["routing_indices"]
                 if prompt_tokens_count:
                     choice_data["prompt_moe_topk_indices"] = result["routing_indices"][
                         :prompt_tokens_count
                     ]
+                    choice_data["generation_moe_topk_indices"] = result["routing_indices"][
+                        prompt_tokens_count:
+                    ]
+            routing_indices = result.get("routing_indices")
+            if routing_indices is not None and hasattr(routing_indices, "shape") and len(routing_indices.shape) == 3:
+                choice_data["moe_metadata"] = {
+                    "num_moe_layers": int(routing_indices.shape[1]),
+                    "topk": int(routing_indices.shape[2]),
+                }
+            elif result.get("routing_block_store_key") is not None:
+                model_config = current_app.config.get("model_config")
+                if model_config is not None:
+                    num_moe_layers = getattr(model_config, "num_moe_layers", None)
+                    topk = getattr(model_config, "moe_router_topk", None)
+                    if num_moe_layers is not None and topk is not None:
+                        choice_data["moe_metadata"] = {
+                            "num_moe_layers": num_moe_layers,
+                            "topk": topk,
+                        }
 
             choices.append(choice_data)
             if choice_data["generation_log_probs"] is None:

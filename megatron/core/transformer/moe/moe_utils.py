@@ -668,6 +668,7 @@ def topk_routing_with_score_function(
     fused: bool = False,
     router_replay: Optional['RouterReplay'] = None,
     dense_output: bool = False,
+    topk_routing_replay_indices: Optional[torch.Tensor] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """Compute the routing probabilities and map for top-k selection with score function.
 
@@ -731,6 +732,7 @@ def topk_routing_with_score_function(
         topk: int,
         num_groups: Optional[int] = None,
         group_topk: Optional[int] = None,
+        topk_replay_indices: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         """Compute the top-k indices for the given scores.
 
@@ -741,10 +743,15 @@ def topk_routing_with_score_function(
                                         Defaults to None.
             group_topk (int, optional): The number of top-k indices to compute for each group.
                                         Defaults to None.
+            topk_replay_indices (torch.Tensor, optional): Pre-determined top-k indices for replay.
+                                                          Defaults to None.
 
         Returns:
             Tuple[torch.Tensor, torch.Tensor]: The top-k indices and the top-k scores.
         """
+        if topk_replay_indices is not None:
+            topk_scores = torch.gather(scores, dim=1, index=topk_replay_indices)
+            return topk_scores, topk_replay_indices
         if group_topk:
             return group_limited_topk(
                 scores=scores,
@@ -758,10 +765,8 @@ def topk_routing_with_score_function(
             return torch.topk(scores, k=topk, dim=1)
 
     def compute_topk(scores, topk, num_groups=None, group_topk=None):
-        # Default behavior if no replay is active
-
         if router_replay is None:
-            return _compute_topk(scores, topk, num_groups=num_groups, group_topk=group_topk)
+            return _compute_topk(scores, topk, num_groups=num_groups, group_topk=group_topk, topk_replay_indices=topk_routing_replay_indices)
         else:
             return router_replay.get_replay_topk(
                 scores, topk, num_groups, group_topk, _compute_topk

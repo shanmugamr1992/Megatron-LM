@@ -346,13 +346,13 @@ class MoELayer(BaseMoELayer):
             self.shared_expert_overlap = self._saved_shared_expert_overlap
 
     @maybe_skip_or_early_return_by_cudagraph("route")
-    def route(self, hidden_states: torch.Tensor, padding_mask: Optional[torch.Tensor] = None):
+    def route(self, hidden_states: torch.Tensor, padding_mask: Optional[torch.Tensor] = None, moe_topk_routing_replay_indices=None):
         """Compute token routing for preprocessing.
 
         This method uses the router to determine which experts to send each token to,
         producing routing probabilities and a mapping.
         """
-        probs, routing_map = apply_module(self.router)(hidden_states, padding_mask)
+        probs, routing_map = apply_module(self.router)(hidden_states, padding_mask, moe_topk_routing_replay_indices=moe_topk_routing_replay_indices)
         return probs, routing_map
 
     @maybe_skip_or_early_return_by_cudagraph("preprocess")
@@ -473,6 +473,7 @@ class MoELayer(BaseMoELayer):
         hidden_states: torch.Tensor,
         intermediate_tensors=None,
         padding_mask: Optional[torch.Tensor] = None,
+        moe_topk_routing_replay_indices=None,
     ):
         """Forward pass for the MoE layer.
 
@@ -504,7 +505,7 @@ class MoELayer(BaseMoELayer):
             try:
                 if "route" in self.fwd_execution_map:
                     shared_expert_output = self.shared_experts_compute(hidden_states)
-                    probs, routing_map = self.route(hidden_states, padding_mask)
+                    probs, routing_map = self.route(hidden_states, padding_mask, moe_topk_routing_replay_indices=moe_topk_routing_replay_indices)
                     hidden_states, probs = self.preprocess(hidden_states, probs, routing_map)
 
                     if intermediate_tensors is not None:

@@ -33,6 +33,10 @@ from megatron.core.transformer.multi_token_prediction import (
 from megatron.core.transformer.spec_utils import ModuleSpec
 from megatron.core.transformer.transformer_block import TransformerBlock
 from megatron.core.transformer.transformer_config import TransformerConfig
+from megatron.core.transformer.moe.model_utils import (
+    initialize_moe_layer_metadata,
+    sequence_parallelize_extra_input_like_tensor,
+)
 from megatron.core.utils import (
     WrappedTensor,
     deprecate_inference_params,
@@ -486,6 +490,7 @@ class GPTModel(LanguageModule):
         inference_params: Optional[BaseInferenceContext] = None,
         loss_mask: Optional[Tensor] = None,
         padding_mask: Optional[Tensor] = None,
+        moe_topk_routing_replay_indices: Optional[Tensor] = None,
         is_spec_decode: Optional[bool] = None,
     ) -> Tensor:
         """Forward function of the GPT Model This function passes the input tensors
@@ -529,6 +534,17 @@ class GPTModel(LanguageModule):
 
         rotary_pos_cos_sin = preproc_output[6] if len(preproc_output) == 7 else None
 
+        batch_size, seq_length = input_ids.shape[:2]
+        moe_topk_routing_replay_indices = sequence_parallelize_extra_input_like_tensor(
+            moe_topk_routing_replay_indices,
+            batch_size=batch_size,
+            seq_length=seq_length,
+            reduce_scatter_embeddings=(
+                self.config.sequence_parallel and self.scatter_embedding_sequence_parallel
+            ),
+            tp_group=self.pg_collection.tp,
+        )
+
         # Run decoder.
         hidden_states = self.decoder(
             hidden_states=decoder_input,
@@ -541,6 +557,7 @@ class GPTModel(LanguageModule):
             packed_seq_params=packed_seq_params,
             sequence_len_offset=sequence_len_offset,
             padding_mask=padding_mask,
+            moe_topk_routing_replay_indices=moe_topk_routing_replay_indices,
             **(extra_block_kwargs or {}),
         )
 

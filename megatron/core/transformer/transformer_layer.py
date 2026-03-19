@@ -700,11 +700,13 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
         This method calls the core computation of a transformer layer, including
         self-attention, cross-attention (if applicable), and feed-forward operations.
         """
+        moe_topk_routing_replay_indices = kwargs.pop("moe_topk_routing_replay_indices", None)
         hidden_states, context = self._forward_attention(*args, **kwargs)
         output = self._forward_mlp(
             hidden_states,
             kwargs.get("inference_context", None),
             padding_mask=kwargs.get("padding_mask", None),
+            moe_topk_routing_replay_indices=moe_topk_routing_replay_indices,
         )
         return output, context
 
@@ -730,6 +732,7 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
         hidden_states: Tensor,
         inference_context: BaseInferenceContext | None = None,
         padding_mask: Tensor | None = None,
+        moe_topk_routing_replay_indices: Tensor | None = None,
     ) -> Tensor | list[Tensor | None]:
         """
         Perform a forward pass through the feed-forward layer.
@@ -815,7 +818,16 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
                 # Set the residual for fused reduce-scatter + add + layer-norm + all-gather
                 # operation in MLP's fc2.
                 self._set_fc2_residual(residual)
-            mlp_output_with_bias = self.mlp(pre_mlp_layernorm_output, padding_mask=padding_mask)
+            if self.is_moe_layer and moe_topk_routing_replay_indices is not None:
+                mlp_output_with_bias = self.mlp(
+                    pre_mlp_layernorm_output,
+                    padding_mask=padding_mask,
+                    moe_topk_routing_replay_indices=moe_topk_routing_replay_indices,
+                )
+            else:
+                mlp_output_with_bias = self.mlp(
+                    pre_mlp_layernorm_output, padding_mask=padding_mask
+                )
 
         nvtx_range_pop(suffix="mlp")
 
@@ -1463,7 +1475,13 @@ class MoETransformerLayer(TransformerLayer):
         output = self.mlp(None, intermediate_tensors=(output, shared_expert_output))
         return self._forward_post_mlp((output, mlp_bias), residual)
 
-    def _forward_mlp(self, hidden_states, inference_context=None, padding_mask=None):
+    def _forward_mlp(
+        self,
+        hidden_states,
+        inference_context=None,
+        padding_mask=None,
+        moe_topk_routing_replay_indices=None,
+    ):
         """
         Orchestrates the MLP forward pass, handling partial CUDA graph execution logic.
 
@@ -1523,4 +1541,8 @@ class MoETransformerLayer(TransformerLayer):
             else:
                 return _forward_mlp_partial_cudagraphs(hidden_states, padding_mask=padding_mask)
         else:
-            return super()._forward_mlp(hidden_states, padding_mask=padding_mask)
+            return super()._forward_mlp(
+                hidden_states,
+                padding_mask=padding_mask,
+                moe_topk_routing_replay_indices=moe_topk_routing_replay_indices,
+            )
