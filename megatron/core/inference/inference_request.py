@@ -795,12 +795,13 @@ class DynamicInferenceRequestRecord:
             "req_id": req_id,
             "key": "moe_topk_indices",
         }
-
-        logging.info(
-            f"NeMo-RL block store put: req_id={req_id} "
-            f"shape={list(routing_indices.shape)} dtype={routing_indices.dtype} "
-            f"instance_id={block_store_instance_id}"
-        )
+        if req_id == "4":
+            logging.info(
+                f"SHANDEBUG : block store put: req_id={req_id} "
+                f"shape={list(routing_indices.shape)} "
+                f"instance_id={block_store_instance_id}"
+                f"min={int(routing_indices.min())}, max={int(routing_indices.max())}, sum={int(routing_indices.sum())}"
+            )
 
         # Set cache key and clear indices on all sub-requests.
         for r in self.requests:

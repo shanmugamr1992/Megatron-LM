@@ -18,6 +18,7 @@ from megatron.core.quantization.utils import get_quant_config_or_none
 from megatron.core.tensor_parallel import gather_from_sequence_parallel_region
 from megatron.core.transformer import TransformerConfig
 from megatron.core.transformer.enums import ModelType
+from megatron.core.transformer.moe.model_utils import sequence_parallelize_extra_input_like_tensor
 from megatron.core.transformer.multi_token_prediction import (
     MultiTokenPredictionBlock,
     mtp_on_this_rank,
@@ -129,6 +130,7 @@ class MambaModel(LanguageModule):
         self.parallel_output = parallel_output
         self.share_embeddings_and_output_weights = share_embeddings_and_output_weights
         self.position_embedding_type = position_embedding_type
+        self.scatter_embedding_sequence_parallel = scatter_embedding_sequence_parallel
         self.vp_stage = vp_stage
 
         # Backward compatibility for deprecated hybrid parameters
@@ -312,6 +314,7 @@ class MambaModel(LanguageModule):
         packed_seq_params: Optional[PackedSeqParams] = None,
         padding_mask: Optional[Tensor] = None,
         is_spec_decode: Optional[bool] = None,
+        moe_topk_routing_replay_indices: Optional[Tensor] = None,
     ) -> Tensor:
         """Forward function of the Mamba model. This function passes the input tensors
         through the embedding layer, and then the decoder and finally into the post
@@ -364,6 +367,17 @@ class MambaModel(LanguageModule):
         if in_inference_mode:
             decoder_input = WrappedTensor(decoder_input)
 
+        batch_size, seq_length = input_ids.shape[:2]
+        moe_topk_routing_replay_indices = sequence_parallelize_extra_input_like_tensor(
+            moe_topk_routing_replay_indices,
+            batch_size=batch_size,
+            seq_length=seq_length,
+            reduce_scatter_embeddings=(
+                self.config.sequence_parallel and self.scatter_embedding_sequence_parallel
+            ),
+            tp_group=self.pg_collection.tp,
+        )
+
         # The following assert will currently fail when running inference.
         # Commented out for now.
         # TODO (duncan/rwaleffe): (1) confirm that the externally-generated
@@ -382,6 +396,7 @@ class MambaModel(LanguageModule):
             rotary_pos_emb=rotary_pos_emb,
             packed_seq_params=packed_seq_params,
             padding_mask=padding_mask,
+            moe_topk_routing_replay_indices=moe_topk_routing_replay_indices,
         )
 
         output_weight = None

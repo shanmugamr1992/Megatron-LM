@@ -667,6 +667,7 @@ def topk_routing_with_score_function(
     expert_bias: Optional[torch.Tensor] = None,
     fused: bool = False,
     router_replay: Optional['RouterReplay'] = None,
+    topk_routing_replay_indices: Optional[torch.Tensor] = None,
     dense_output: bool = False,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """Compute the routing probabilities and map for top-k selection with score function.
@@ -715,7 +716,8 @@ def topk_routing_with_score_function(
             raise ValueError(
                 "fused_topk_with_score_function is not available. Please install TE >= 2.6.0."
             )
-        return fused_topk_with_score_function(
+        assert topk_routing_replay_indices is None
+        routing_probs, routing_map = fused_topk_with_score_function(
             logits=logits,
             topk=topk,
             use_pre_softmax=use_pre_softmax,
@@ -725,12 +727,15 @@ def topk_routing_with_score_function(
             score_function=score_function,
             expert_bias=expert_bias,
         )
+        topk_routing_indices = None
+        return routing_probs, routing_map, topk_routing_indices
 
     def _compute_topk(
         scores: torch.Tensor,
         topk: int,
         num_groups: Optional[int] = None,
         group_topk: Optional[int] = None,
+        topk_replay_indices: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         """Compute the top-k indices for the given scores.
 
@@ -745,7 +750,8 @@ def topk_routing_with_score_function(
         Returns:
             Tuple[torch.Tensor, torch.Tensor]: The top-k indices and the top-k scores.
         """
-        if group_topk:
+        if (num_groups and num_groups > 1) or (group_topk and group_topk > 1):
+            assert topk_replay_indices is None
             return group_limited_topk(
                 scores=scores,
                 topk=topk,
@@ -754,15 +760,19 @@ def topk_routing_with_score_function(
                 num_groups=num_groups,
                 group_topk=group_topk,
             )
+        elif topk_replay_indices is not None:
+            topk_scores = torch.gather(scores, dim=1, index=topk_replay_indices)
+            return topk_scores, topk_replay_indices
         else:
             return torch.topk(scores, k=topk, dim=1)
 
-    def compute_topk(scores, topk, num_groups=None, group_topk=None):
+    def compute_topk(scores, topk, num_groups=None, group_topk=None, topk_replay_indices=None):
         # Default behavior if no replay is active
 
         if router_replay is None:
-            return _compute_topk(scores, topk, num_groups=num_groups, group_topk=group_topk)
+            return _compute_topk(scores, topk, num_groups=num_groups, group_topk=group_topk, topk_replay_indices=topk_replay_indices)
         else:
+            assert topk_replay_indices is not None
             return router_replay.get_replay_topk(
                 scores, topk, num_groups, group_topk, _compute_topk
             )
@@ -770,18 +780,18 @@ def topk_routing_with_score_function(
     if score_function == "softmax":
         if use_pre_softmax:
             scores = torch.softmax(logits, dim=-1, dtype=torch.float32).type_as(logits)
-            probs, top_indices = compute_topk(scores, topk, num_groups, group_topk)
+            probs, top_indices = compute_topk(scores, topk, num_groups, group_topk, topk_routing_replay_indices)
         else:
-            scores, top_indices = compute_topk(logits, topk, num_groups, group_topk)
+            scores, top_indices = compute_topk(logits, topk, num_groups, group_topk, topk_routing_replay_indices)
             probs = torch.softmax(scores, dim=-1, dtype=torch.float32).type_as(logits)
     elif score_function == "sigmoid":
         scores = torch.sigmoid(logits.float()).type_as(logits)
         if expert_bias is not None:
             scores_for_routing = scores + expert_bias
-            _, top_indices = compute_topk(scores_for_routing, topk, num_groups, group_topk)
+            _, top_indices = compute_topk(scores_for_routing, topk, num_groups, group_topk, topk_routing_replay_indices)
             scores = torch.gather(scores, dim=1, index=top_indices).type_as(logits)
         else:
-            scores, top_indices = compute_topk(scores, topk, num_groups, group_topk)
+            scores, top_indices = compute_topk(scores, topk, num_groups, group_topk, topk_routing_replay_indices)
         probs = scores / (scores.sum(dim=-1, keepdim=True) + 1e-20) if topk > 1 else scores
     else:
         raise ValueError(f"Invalid score_function: {score_function}")
@@ -808,7 +818,8 @@ def topk_routing_with_score_function(
         routing_probs = torch.zeros_like(logits).scatter(1, top_indices, probs)
         routing_map = torch.zeros_like(logits).int().scatter(1, top_indices, 1).bool()
 
-    return routing_probs, routing_map
+    topk_routing_indices = top_indices
+    return routing_probs, routing_map, topk_routing_indices
 
 
 def compute_routing_scores_for_aux_loss(

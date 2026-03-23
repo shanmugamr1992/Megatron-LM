@@ -24,6 +24,10 @@ from megatron.core.pipeline_parallel.fine_grained_activation_offload import (
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.quantization.utils import get_quant_config_or_none
 from megatron.core.tensor_parallel import gather_from_sequence_parallel_region
+from megatron.core.transformer.moe.model_utils import (
+    initialize_moe_layer_metadata,
+    sequence_parallelize_extra_input_like_tensor,
+)
 from megatron.core.transformer.enums import CudaGraphScope, ModelType
 from megatron.core.transformer.multi_token_prediction import (
     MultiTokenPredictionBlock,
@@ -122,6 +126,7 @@ class GPTModel(LanguageModule):
         self.share_embeddings_and_output_weights = share_embeddings_and_output_weights
         self.vp_stage = vp_stage
         self.disable_param_offloading = True
+        self.scatter_embedding_sequence_parallel = scatter_embedding_sequence_parallel
 
         if hasattr(self.config, 'position_embedding_type'):
             self.position_embedding_type = self.config.position_embedding_type
@@ -214,6 +219,8 @@ class GPTModel(LanguageModule):
             pg_collection=self.pg_collection,
             vp_stage=vp_stage,
         )
+
+        self.decoder.num_moe_layers = initialize_moe_layer_metadata(self.decoder.layers)
 
         if self.mtp_process:
             self.mtp = MultiTokenPredictionBlock(
@@ -487,6 +494,7 @@ class GPTModel(LanguageModule):
         loss_mask: Optional[Tensor] = None,
         padding_mask: Optional[Tensor] = None,
         is_spec_decode: Optional[bool] = None,
+        moe_topk_routing_replay_indices: Optional[Tensor] = None,
     ) -> Tensor:
         """Forward function of the GPT Model This function passes the input tensors
         through the embedding layer, and then the decoder and finally into the post
@@ -529,6 +537,17 @@ class GPTModel(LanguageModule):
 
         rotary_pos_cos_sin = preproc_output[6] if len(preproc_output) == 7 else None
 
+        batch_size, seq_length = input_ids.shape[:2]
+        moe_topk_routing_replay_indices = sequence_parallelize_extra_input_like_tensor(
+            moe_topk_routing_replay_indices,
+            batch_size=batch_size,
+            seq_length=seq_length,
+            reduce_scatter_embeddings=(
+                self.config.sequence_parallel and self.scatter_embedding_sequence_parallel
+            ),
+            tp_group=self.pg_collection.tp,
+        )
+
         # Run decoder.
         hidden_states = self.decoder(
             hidden_states=decoder_input,
@@ -541,6 +560,7 @@ class GPTModel(LanguageModule):
             packed_seq_params=packed_seq_params,
             sequence_len_offset=sequence_len_offset,
             padding_mask=padding_mask,
+            moe_topk_routing_replay_indices=moe_topk_routing_replay_indices,
             **(extra_block_kwargs or {}),
         )
 

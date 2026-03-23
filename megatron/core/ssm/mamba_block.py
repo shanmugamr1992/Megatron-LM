@@ -104,6 +104,7 @@ class MambaStack(GraphableMegatronModule, MegatronModule):
             "--hybrid-layer-pattern by MambaModel."
         )
         self.layer_type_list = layer_type_list
+        moe_layer_idx = 0
 
         # Build layers from the pre-selected segment
         self.layers = nn.ModuleList()
@@ -142,6 +143,8 @@ class MambaStack(GraphableMegatronModule, MegatronModule):
                         pg_collection=pg_collection,
                         add_layer_offset=False,
                     )
+                    layer.set_moe_layer_number(moe_layer_idx)
+                    moe_layer_idx += 1
                 elif layer_type == LayerSymbols.MOE:
                     layer = build_module(
                         submodules.moe_layer,
@@ -153,6 +156,11 @@ class MambaStack(GraphableMegatronModule, MegatronModule):
                 else:
                     assert False, "unexpected layer_type"
             self.layers.append(layer)
+        
+        self.num_moe_layers = moe_layer_idx
+        for i, layer_type in enumerate(self.layer_type_list):
+            if layer_type == LayerSymbols.MOE:
+                self.layers[i].set_num_moe_layers(self.num_moe_layers)        
 
         # Required for activation recomputation
         self.num_layers_per_pipeline_rank = len(self.layers)
@@ -228,6 +236,7 @@ class MambaStack(GraphableMegatronModule, MegatronModule):
         inference_params: Optional[BaseInferenceContext] = None,
         packed_seq_params: Optional[PackedSeqParams] = None,
         padding_mask=None,
+        moe_topk_routing_replay_indices: Optional[Tensor] = None,
     ):
         """
         Forward function of the MambaStack class.
@@ -311,7 +320,7 @@ class MambaStack(GraphableMegatronModule, MegatronModule):
                 return nullcontext()
 
         with outer_fp8_context:
-            for layer in self.layers:
+            for layer_type, layer in zip(self.layer_type_list, self.layers):
                 # Layers have 1-indexed layer numbers attribute.
                 inner_quant_context = get_inner_quant_context(self.config, layer.layer_number - 1)
                 with inner_quant_context:
@@ -324,8 +333,10 @@ class MambaStack(GraphableMegatronModule, MegatronModule):
                             sequence_len_offset=sequence_len_offset,
                             packed_seq_params=packed_seq_params,
                             padding_mask=padding_mask,
+                            moe_topk_routing_replay_indices=moe_topk_routing_replay_indices,
                         )
                     else:  # MambaLayer, Expert, or MLP
+                        assert layer_type != LayerSymbols.MOE
                         hidden_states = layer(
                             hidden_states=hidden_states,
                             attention_mask=attention_mask,

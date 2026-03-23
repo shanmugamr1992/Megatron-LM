@@ -5,6 +5,16 @@ from typing import Optional, Union
 
 import torch
 
+import json
+import os
+from megatron.core.parallel_state import (
+    get_context_parallel_rank,
+    get_expert_model_parallel_rank,
+    get_expert_tensor_parallel_rank,
+    get_pipeline_model_parallel_rank,
+    get_tensor_model_parallel_rank,
+)
+
 from megatron.core.jit import jit_fuser
 from megatron.core.transformer.module import MegatronModule
 from megatron.core.transformer.moe.moe_utils import (
@@ -132,6 +142,14 @@ class Router(ABC, MegatronModule):
         """Set the layer number for the router."""
         self.layer_number = layer_number
 
+    def set_moe_layer_number(self, moe_layer_idx: int):
+        """Set the MoE layer number for the router."""
+        if self.moe_layer_idx is not None:
+            return
+        self.moe_layer_idx = moe_layer_idx
+
+    def set_num_moe_layers(self, num_moe_layers: int):
+        self.num_moe_layers = num_moe_layers
 
 class TopKRouter(Router):
     """Route each token to the top-k experts.
@@ -583,7 +601,7 @@ class TopKRouter(Router):
                     routing_map = routing_map & (~padding_mask)
                 self.local_tokens_per_expert += routing_map.sum(dim=0)
 
-    def routing(self, logits: torch.Tensor, padding_mask: Optional[torch.Tensor] = None):
+    def routing(self, logits: torch.Tensor, padding_mask: Optional[torch.Tensor] = None, topk_routing_replay_indices: Optional[torch.Tensor] = None):
         """Top-k routing function
 
         Args:
@@ -607,11 +625,21 @@ class TopKRouter(Router):
         # Apply Z-Loss
         logits = self.apply_z_loss(logits, padding_mask=padding_mask)
 
+
+        noreplay_probs = None
+        routing_noreplay_map = None
+        topk_routing_noreplay_indices = None
+
+        probs = None
+        routing_map = None
+        topk_routing_indices = None
+
         # Calculate probs and routing_map for token dispatching
         if self.routing_type == "sinkhorn":
+            assert topk_routing_replay_indices is None
             probs, routing_map = self.sinkhorn_load_balancing(logits)
         else:
-            probs, routing_map = topk_routing_with_score_function(
+            noreplay_probs, routing_noreplay_map, topk_routing_noreplay_indices = topk_routing_with_score_function(
                 logits,
                 self.topk,
                 use_pre_softmax=self.config.moe_router_pre_softmax,
@@ -623,6 +651,39 @@ class TopKRouter(Router):
                 fused=self.config.moe_router_fusion,
                 router_replay=self.router_replay,
             )
+
+        topk_routing_replay_indices_premask = topk_routing_replay_indices
+        if topk_routing_replay_indices is not None:
+            # NB: only do non-replay re-padding when K >= 2 because otherwise
+            # can't distinguish padding rows.
+            assert topk_routing_noreplay_indices is not None
+            if self.topk > 1:
+                topk_routing_replay_repad_mask = (torch.sum(topk_routing_replay_indices, dim=-1) == 0).to(
+                    device=topk_routing_replay_indices.device
+                )
+                topk_routing_replay_indices_clone = topk_routing_replay_indices.clone().to(
+                    dtype=topk_routing_noreplay_indices.dtype
+                )
+                topk_routing_replay_indices_clone[topk_routing_replay_repad_mask] = (
+                    topk_routing_noreplay_indices[topk_routing_replay_repad_mask]
+                )
+                topk_routing_replay_indices = topk_routing_replay_indices_clone
+            probs, routing_map, topk_routing_indices = topk_routing_with_score_function(
+                logits,
+                self.topk,
+                use_pre_softmax=self.config.moe_router_pre_softmax,
+                num_groups=self.config.moe_router_num_groups,
+                group_topk=self.config.moe_router_group_topk,
+                scaling_factor=self.config.moe_router_topk_scaling_factor,
+                score_function=self.score_function,
+                expert_bias=self.expert_bias,
+                fused=self.config.moe_router_fusion,
+                router_replay=self.router_replay,
+            )
+        else:
+            probs = noreplay_probs
+            routing_map = routing_noreplay_map
+            topk_routing_indices = topk_routing_noreplay_indices            
 
         # Apply token dropping to probs and routing_map.
         if self.config.moe_expert_capacity_factor is not None:
@@ -677,7 +738,8 @@ class TopKRouter(Router):
             self.global_tokens_per_expert.zero_()
             self.ga_steps.zero_()
 
-    def forward(self, input: torch.Tensor, padding_mask: Optional[torch.Tensor] = None):
+    def forward(self, input: torch.Tensor, padding_mask: Optional[torch.Tensor] = None,
+    topk_routing_replay_indices: Optional[torch.Tensor] = None):
         """
         Forward pass of the router.
 
@@ -697,7 +759,7 @@ class TopKRouter(Router):
             # Apply force load balancing with random logits for benchmark
             logits = apply_random_logits(logits)
 
-        probs, routing_map = self.routing(logits, padding_mask=padding_mask)
+        probs, routing_map = self.routing(logits, padding_mask=padding_mask, topk_routing_replay_indices=topk_routing_replay_indices)
 
         return probs, routing_map
 
