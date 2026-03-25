@@ -143,8 +143,6 @@ class MambaStack(GraphableMegatronModule, MegatronModule):
                         pg_collection=pg_collection,
                         add_layer_offset=False,
                     )
-                    layer.set_moe_layer_number(moe_layer_idx)
-                    moe_layer_idx += 1
                 elif layer_type == LayerSymbols.MOE:
                     layer = build_module(
                         submodules.moe_layer,
@@ -153,6 +151,8 @@ class MambaStack(GraphableMegatronModule, MegatronModule):
                         pg_collection=pg_collection,
                         add_layer_offset=False,
                     )
+                    layer.set_moe_layer_number(moe_layer_idx)
+                    moe_layer_idx += 1
                 else:
                     assert False, "unexpected layer_type"
             self.layers.append(layer)

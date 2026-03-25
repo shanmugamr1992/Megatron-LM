@@ -48,6 +48,9 @@ class RoutingMetadata:
 
         # Static buffer for CUDA graph compatibility.
         # Shape: [max_tokens, num_moe_layers, moe_router_topk]
+        # Must be int32 (not int16) because NCCL all-gather in
+        # gather_from_sequence_parallel_region does not support Short tensors.
+        # The conversion to int16 happens later at numpy accumulation time.
         self.routing_indices_buffer = torch.empty(
             (self.max_tokens, self.num_moe_layers, self.moe_router_topk),
             dtype=torch.int32,

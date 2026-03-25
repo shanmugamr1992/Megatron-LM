@@ -57,6 +57,8 @@ class Router(ABC, MegatronModule):
         self.num_experts = self.config.num_moe_experts
         self.moe_aux_loss_func = None
         self.layer_number = None
+        self.moe_layer_idx = None
+        self.num_moe_layers = None
         self.is_mtp_layer = is_mtp_layer
         self.tp_group = pg_collection.tp
         self.cp_group = pg_collection.cp
@@ -618,12 +620,24 @@ class TopKRouter(Router):
         seq_length, bsz = logits.shape[:2]
         logits = logits.view(-1, self.config.num_moe_experts)
 
+        if topk_routing_replay_indices is not None:
+            assert self.num_moe_layers > 1, "num_moe_layers must be greater than 1 for routing replay"
+            assert self.moe_layer_idx is not None, "moe_layer_idx must be set for routing replay"
+            assert self.moe_layer_idx < self.num_moe_layers, "moe_layer_idx must be less than num_moe_layers"
+            assert seq_length == topk_routing_replay_indices.shape[0]
+            assert bsz == topk_routing_replay_indices.shape[1]
+            topk_routing_replay_indices = topk_routing_replay_indices.view(-1, self.num_moe_layers, self.topk)[:,self.moe_layer_idx,:]
+        else:
+            topk_routing_replay_indices = None
+
         # Flatten padding_mask to [num_tokens] if provided
         if padding_mask is not None:
             padding_mask = padding_mask.reshape(-1)
 
         # Apply Z-Loss
         logits = self.apply_z_loss(logits, padding_mask=padding_mask)
+
+        
 
 
         noreplay_probs = None

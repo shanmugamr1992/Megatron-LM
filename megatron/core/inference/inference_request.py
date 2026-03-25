@@ -765,21 +765,67 @@ class DynamicInferenceRequestRecord:
 
         return request
 
+    @staticmethod
+    def _normalize_routing_indices_array(
+        routing_indices: np.ndarray,
+        expected_len: int,
+    ) -> Optional[np.ndarray]:
+        """Normalize routing indices to exactly expected_len rows.
+
+        Mirrors vLLM's _normalize_moe_topk_indices_array: forces np.int16
+        dtype, pads with zeros if too short, truncates if too long.
+        """
+        if routing_indices is None:
+            return None
+
+        routing_indices = np.asarray(routing_indices, dtype=np.int16)
+        if routing_indices.ndim == 0:
+            return None
+
+        seq_len = int(routing_indices.shape[0])
+        if seq_len > expected_len:
+            routing_indices = routing_indices[:expected_len]
+        elif seq_len < expected_len:
+            if seq_len == 0:
+                return None
+            pad_shape = (expected_len - seq_len, *routing_indices.shape[1:])
+            routing_indices = np.concatenate(
+                (routing_indices, np.zeros(pad_shape, dtype=routing_indices.dtype)),
+                axis=0,
+            )
+
+        return routing_indices
+
     def dump_routing_indices_to_block_store(self, block_store_instance, block_store_instance_rank, block_store_instance_id):
         """Write routing indices to block store and replace with cache key.
 
         Mirrors vLLM serving.py _maybe_store_moe_topk_indices.
-        Merges routing_indices across all sub-requests, writes to block store,
-        sets routing_block_store_key, and clears routing_indices to free memory.
-        """
-        import logging
+        Merges routing_indices across all sub-requests, normalizes to np.int16
+        with padding/truncation to the expected total sequence length, writes
+        to block store, sets routing_block_store_key, and clears
+        routing_indices to free memory.
 
+        The expected length is prompt_len + gen_len.  The last generated token
+        (typically EOS) was sampled but never routed, so it will be zero-padded
+        by _normalize_routing_indices_array.  This matches vLLM which also
+        zero-pads the final unrouted token position.
+        """
         parts = [r.routing_indices for r in self.requests if r.routing_indices is not None]
         if not parts:
             return
 
         routing_indices = np.concatenate(parts) if len(parts) > 1 else parts[0]
         req_id = str(self.requests[0].request_id)
+
+        prompt_len = len(self.requests[0].prompt_tokens) if self.requests[0].prompt_tokens is not None else 0
+        gen_len = len(self.requests[-1].generated_tokens) if self.requests[-1].generated_tokens else 0
+        expected_len = prompt_len + gen_len
+
+        routing_indices = self._normalize_routing_indices_array(
+            routing_indices, expected_len
+        )
+        if routing_indices is None:
+            return
 
         ray.get(
             block_store_instance.put_numpy.remote(
@@ -795,11 +841,13 @@ class DynamicInferenceRequestRecord:
             "req_id": req_id,
             "key": "moe_topk_indices",
         }
+        import logging
         if req_id == "4":
             logging.info(
                 f"SHANDEBUG : block store put: req_id={req_id} "
                 f"shape={list(routing_indices.shape)} "
                 f"instance_id={block_store_instance_id}"
+                f"indices={routing_indices}"
                 f"min={int(routing_indices.min())}, max={int(routing_indices.max())}, sum={int(routing_indices.sum())}"
             )
 

@@ -772,7 +772,7 @@ def topk_routing_with_score_function(
         if router_replay is None:
             return _compute_topk(scores, topk, num_groups=num_groups, group_topk=group_topk, topk_replay_indices=topk_replay_indices)
         else:
-            assert topk_replay_indices is not None
+            assert topk_replay_indices is None
             return router_replay.get_replay_topk(
                 scores, topk, num_groups, group_topk, _compute_topk
             )
