@@ -975,6 +975,7 @@ class DynamicInferenceEngine(AbstractEngine):
         request_id: int,
         prompt: Union[str, List[int], Tensor],
         sampling_params: Optional[SamplingParams] = None,
+        rl_metadata: Optional[dict] = None,
     ) -> asyncio.Future[DynamicInferenceRequest]:
         """Add request to inference context.
 
@@ -982,6 +983,7 @@ class DynamicInferenceEngine(AbstractEngine):
             request_id (int): Unique ID of request.
             prompt (Union[str, Tensor]): Prompt as either a text string or token IDs.
             sampling_params (Optional[SamplingParams]): Sampling parameters for the request.
+            rl_metadata (Optional[dict]): RL metadata from NeMo Gym for block store GC tagging.
 
         Return:
             Returns an asyncio `Future[DynamicInferenceRequest]` for the user to wait on.
@@ -1024,6 +1026,7 @@ class DynamicInferenceEngine(AbstractEngine):
             sampling_params=sampling_params,
             block_size_tokens=self.context.block_size_tokens,
             enable_prefix_caching=self.context.enable_prefix_caching,
+            rl_metadata=rl_metadata,
         )
 
         # Add request.
@@ -2080,10 +2083,12 @@ class DynamicInferenceEngine(AbstractEngine):
             data = msgpack.unpackb(message, raw=False)
             header = Headers(data[0])
             if header == Headers.SUBMIT_REQUEST:
-                request_id, prompt, sampling_params = data[1:]
+                fields = data[1:]
+                request_id, prompt, sampling_params = fields[:3]
+                rl_metadata = fields[3] if len(fields) > 3 else None
                 sampling_params = SamplingParams.deserialize(sampling_params)
                 range_push("add_request")
-                self.add_request(request_id, prompt, sampling_params)
+                self.add_request(request_id, prompt, sampling_params, rl_metadata=rl_metadata)
                 range_pop()
             elif header == Headers.SET_GENERATION_EPOCH:
                 new_generation_epoch = data[1]

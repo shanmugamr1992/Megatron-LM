@@ -391,6 +391,8 @@ class DynamicInferenceRequest(InferenceRequest):
     # routing_block_store_key is set when routing_indices are written to block store.
     # Contains {"instance_rank", "instance_id", "req_id", "key"} for retrieval.
     routing_block_store_key: Optional[dict] = None
+    # rl_metadata propagated from the HTTP request for block store GC tagging.
+    rl_metadata: Optional[dict] = None
     finished_chunk_token_count: int = 0
     stop_word_ids: Optional[List[List[int]]] = None  # Tokenized stop words (populated internally)
     _routing_indices_chunks: Optional[List[np.ndarray]] = field(default=None, repr=False)  # Internal storage for routin
@@ -848,11 +850,14 @@ class DynamicInferenceRequestRecord:
         if routing_indices is None:
             return
 
+        rl_metadata = self.requests[0].rl_metadata if self.requests else None
+        put_kwargs = dict(rl_metadata=rl_metadata) if rl_metadata is not None else {}
         ray.get(
             block_store_instance.put_numpy.remote(
                 blockstore_uuid,
                 "moe_topk_indices",
                 routing_indices,
+                **put_kwargs,
             )
         )
 
@@ -876,6 +881,7 @@ class DynamicInferenceRequestRecord:
             f"NeMo-RL block store put: req_id={blockstore_uuid} "
             f"shape={list(routing_indices.shape)} dtype={routing_indices.dtype} "
             f"instance_id={block_store_instance_id}"
+            f"rl_metadata={rl_metadata}"
         )
 
         # Set cache key and clear indices on all sub-requests.

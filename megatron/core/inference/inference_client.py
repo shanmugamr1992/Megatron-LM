@@ -85,7 +85,8 @@ class InferenceClient:
         self.next_request_id = 0
 
     def add_request(
-        self, prompt: Union[str, List[int]], sampling_params: SamplingParams
+        self, prompt: Union[str, List[int]], sampling_params: SamplingParams,
+        rl_metadata: Optional[dict] = None,
     ) -> asyncio.Future:
         """
         Submits a new inference request to the coordinator.
@@ -99,6 +100,8 @@ class InferenceClient:
             sampling_params: An object containing the sampling parameters for
                 text generation (e.g., temperature, top_p). It must have a
                 `serialize()` method.
+            rl_metadata: Optional RL metadata from NeMo Gym for block store
+                GC tagging (contains rl_step used by gc_lte_step).
 
         Returns:
             asyncio.Future: A future that will be resolved with a
@@ -108,6 +111,8 @@ class InferenceClient:
         request_id = self.next_request_id
         self.next_request_id += 1
         payload = [Headers.SUBMIT_REQUEST.value, request_id, prompt, sampling_params.serialize()]
+        if rl_metadata is not None:
+            payload.append(rl_metadata)
         payload_serialized = msgpack.packb(payload, use_bin_type=True)
         self.socket.send(payload_serialized)
         assert request_id not in self.completion_futures

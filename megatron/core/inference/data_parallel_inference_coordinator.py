@@ -351,7 +351,9 @@ class DataParallelInferenceCoordinator:
                     continue
                 # this is a message from a client.
                 # route it to a data parallel rank
-                client_request_id, prompt, sampling_params = deserialized_payload[1:]
+                fields = deserialized_payload[1:]
+                client_request_id, prompt, sampling_params = fields[:3]
+                rl_metadata = fields[3] if len(fields) > 3 else None
                 # map client request_id to server request_id
                 # necessary because multiple clients might have the same request_id.
                 request_id = self.next_request_id
@@ -367,8 +369,11 @@ class DataParallelInferenceCoordinator:
                 else:
                     raise Exception("specialize for <%s> prompt." % type(prompt).__name__)
 
+                engine_payload = [Headers.SUBMIT_REQUEST.value, request_id, prompt, sampling_params]
+                if rl_metadata is not None:
+                    engine_payload.append(rl_metadata)
                 payload = msgpack.packb(
-                    [Headers.SUBMIT_REQUEST.value, request_id, prompt, sampling_params],
+                    engine_payload,
                     use_bin_type=True,
                 )
 

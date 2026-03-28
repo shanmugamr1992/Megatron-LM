@@ -374,8 +374,16 @@ try:
         except ValueError as e:
             return Response(f"Invalid sampling parameter: {e}", status=400)
 
-        # --- 3. Send Requests to Engine ---
-        tasks = [client.add_request(prompt_tokens, sampling_params) for _ in range(n)]
+        # --- 3. Extract RL metadata (for block store GC tagging) ---
+        rl_metadata = None
+        req_metadata = req.get("metadata")
+        if isinstance(req_metadata, dict):
+            rl_metadata = req_metadata.get("rl_metadata")
+        if isinstance(rl_metadata, str):
+            rl_metadata = json.loads(rl_metadata)
+
+        # --- 4. Send Requests to Engine ---
+        tasks = [client.add_request(prompt_tokens, sampling_params, rl_metadata=rl_metadata) for _ in range(n)]
 
         if current_app.config['verbose']:
             start_time = time.perf_counter()
@@ -543,6 +551,11 @@ try:
                 "total_tokens": prompt_token_count + total_completion_tokens,
             },
         }
+
+        # Promote prompt_moe_topk_indices to the response level (matching
+        # vLLM's ChatCompletionResponse format) so NeMo Gym can find it.
+        if choices and "prompt_moe_topk_indices" in choices[0]:
+            response["prompt_moe_topk_indices"] = choices[0]["prompt_moe_topk_indices"]
 
         if HAVE_ORJSON:
             # Use orjson for faster serialization

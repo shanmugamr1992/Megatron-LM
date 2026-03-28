@@ -882,12 +882,16 @@ class InferenceTopKRouter(TopKRouter):
         )
         return probs.squeeze(1), top_indices.squeeze(1)
 
-    def forward(self, input: torch.Tensor, padding_mask: Optional[torch.Tensor] = None):
+    def forward(self, input: torch.Tensor, padding_mask: Optional[torch.Tensor] = None,
+                topk_routing_replay_indices: Optional[torch.Tensor] = None):
         """Simplified forward pass for inference - returns dense tensors only.
 
         Args:
             input (torch.Tensor): Input tensor of shape [seq_length, bsz, hidden_size].
             padding_mask (torch.Tensor, optional): Not used in inference.
+            topk_routing_replay_indices (torch.Tensor, optional): Replay indices
+                from a prior generation pass. Ignored during CUDA-graphed inference
+                iterations (we are *producing* routing indices, not replaying them).
 
         Returns:
             Tuple[torch.Tensor, torch.Tensor]:
@@ -896,6 +900,6 @@ class InferenceTopKRouter(TopKRouter):
         """
 
         if self.training or not self.is_inference_cuda_graphed_iteration:
-            return super().forward(input, padding_mask)
+            return super().forward(input, padding_mask, topk_routing_replay_indices)
 
         return self._forward(input, padding_mask)
