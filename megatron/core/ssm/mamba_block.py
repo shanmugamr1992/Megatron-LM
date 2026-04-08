@@ -160,7 +160,32 @@ class MambaStack(GraphableMegatronModule, MegatronModule):
         self.num_moe_layers = moe_layer_idx
         for i, layer_type in enumerate(self.layer_type_list):
             if layer_type == LayerSymbols.MOE:
-                self.layers[i].set_num_moe_layers(self.num_moe_layers)        
+                self.layers[i].set_num_moe_layers(self.num_moe_layers)
+
+        pp_size = (
+            torch.distributed.get_world_size(self.pp_group)
+            if self.pp_group is not None
+            else 1
+        )
+        if pp_size > 1:
+            pp_rank = torch.distributed.get_rank(self.pp_group)
+            local_count = torch.tensor(
+                [self.num_moe_layers],
+                dtype=torch.long,
+                device=torch.cuda.current_device(),
+            )
+            all_counts = [
+                torch.zeros(1, dtype=torch.long, device=torch.cuda.current_device())
+                for _ in range(pp_size)
+            ]
+            torch.distributed.all_gather(all_counts, local_count, group=self.pp_group)
+            self.global_moe_layer_offset = int(
+                sum(c.item() for c in all_counts[:pp_rank])
+            )
+            self.global_num_moe_layers = int(sum(c.item() for c in all_counts))
+        else:
+            self.global_moe_layer_offset = 0
+            self.global_num_moe_layers = self.num_moe_layers
 
         # Required for activation recomputation
         self.num_layers_per_pipeline_rank = len(self.layers)
@@ -293,6 +318,20 @@ class MambaStack(GraphableMegatronModule, MegatronModule):
             )
         else:
             sequence_len_offset = None
+
+        # When inference uses a different PP size than training, routing replay
+        # indices contain data for all global MoE layers. Slice to this stage's
+        # local layers so the per-layer router reshape works correctly.
+        if (
+            moe_topk_routing_replay_indices is not None
+            and self.num_moe_layers > 0
+            and moe_topk_routing_replay_indices.shape[-2] > self.num_moe_layers
+        ):
+            start = self.global_moe_layer_offset
+            end = start + self.num_moe_layers
+            moe_topk_routing_replay_indices = moe_topk_routing_replay_indices[
+                ..., start:end, :
+            ].contiguous()
 
         # If fp8_recipe is delayed, wrap the entire pass with get_fp8_context(),
         # otherwise do nothing extra at the outer level

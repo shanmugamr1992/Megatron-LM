@@ -624,9 +624,24 @@ class TopKRouter(Router):
             assert self.num_moe_layers > 1, "num_moe_layers must be greater than 1 for routing replay"
             assert self.moe_layer_idx is not None, "moe_layer_idx must be set for routing replay"
             assert self.moe_layer_idx < self.num_moe_layers, "moe_layer_idx must be less than num_moe_layers"
-            assert seq_length == topk_routing_replay_indices.shape[0]
-            assert bsz == topk_routing_replay_indices.shape[1]
+            assert seq_length == topk_routing_replay_indices.shape[0], (
+                f"seq_length mismatch: logits seq_length={seq_length}, "
+                f"replay_indices shape[0]={topk_routing_replay_indices.shape[0]}, "
+                f"full shape={topk_routing_replay_indices.shape}, dtype={topk_routing_replay_indices.dtype}"
+            )
+            assert bsz == topk_routing_replay_indices.shape[1], (
+                f"bsz mismatch: logits bsz={bsz}, "
+                f"replay_indices shape[1]={topk_routing_replay_indices.shape[1]}, "
+                f"full shape={topk_routing_replay_indices.shape}, dtype={topk_routing_replay_indices.dtype}"
+            )
             topk_routing_replay_indices = topk_routing_replay_indices.view(-1, self.num_moe_layers, self.topk)[:,self.moe_layer_idx,:]
+            idx_min = topk_routing_replay_indices.min().item()
+            idx_max = topk_routing_replay_indices.max().item()
+            assert idx_min >= 0 and idx_max < self.config.num_moe_experts, (
+                f"routing replay indices out of bounds: min={idx_min}, max={idx_max}, "
+                f"num_experts={self.config.num_moe_experts}, "
+                f"moe_layer_idx={self.moe_layer_idx}, dtype={topk_routing_replay_indices.dtype}"
+            )
         else:
             topk_routing_replay_indices = None
 
@@ -693,6 +708,7 @@ class TopKRouter(Router):
                 expert_bias=self.expert_bias,
                 fused=self.config.moe_router_fusion,
                 router_replay=self.router_replay,
+                topk_routing_replay_indices=topk_routing_replay_indices,
             )
         else:
             probs = noreplay_probs
