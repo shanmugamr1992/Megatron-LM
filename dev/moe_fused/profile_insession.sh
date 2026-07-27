@@ -8,6 +8,11 @@ set -uo pipefail
 export CUDA_DEVICE_MAX_CONNECTIONS=1
 PROFILE_BS="${PROFILE_BS:-256}"
 PROFILE_OSL="${PROFILE_OSL:-256}"
+# node: one range per kernel inside the graph (default; what every profile in
+# the ledger up to PROFILE-S6 used). graph: one range per graph launch, which
+# removes CUPTI's per-node instrumentation and is the control for whether the
+# per-step graph machinery cost is real.
+CUDA_GRAPH_TRACE="${CUDA_GRAPH_TRACE:-node}"
 
 SCRATCH=/lustre/fsw/portfolios/coreai/users/shanmugamr/agents-space
 CKPT=$SCRATCH/checkpoints/qwen3-30b-a3b-mcore
@@ -17,12 +22,14 @@ export CHECKPOINT_LOAD_PATH="$CKPT"
 VENV=$SCRATCH/envs/megatron_lm/dd356431262b5db4/.venv
 PYBIN=$VENV/bin/python
 
-RUN_DIR=$SCRATCH/sessions/qwen-moe-kernel/prof/$(date +%s)
+SESSION_HANDLE="${SESSION_HANDLE:-qwen-cutlass2}"
+RUN_DIR=$SCRATCH/sessions/${SESSION_HANDLE}/prof/${PROF_TAG:-p}-$(date +%s)
 mkdir -p "$RUN_DIR/torchrun_logs"
 EXTRA="$RUN_DIR/extra_pkgs"; mkdir -p "$EXTRA"
 export PYTHONPATH="$EXTRA:${PYTHONPATH:-}"
 $PYBIN -m pip install --quiet --no-cache-dir --target="$EXTRA" hypercorn aiohttp 2>/dev/null || true
 echo "RUN_DIR=$RUN_DIR"; echo "PYBIN=$PYBIN"
+echo "MCORE_FUSE_FC1_ACT=${MCORE_FUSE_FC1_ACT:-<unset>} MCORE_MOE_FUSED_ALIGN=${MCORE_MOE_FUSED_ALIGN:-<unset>} MCORE_MOE_GEMM_TUNE=${MCORE_MOE_GEMM_TUNE:-<unset>}"
 $PYBIN -c "import torch,transformers;print('torch',torch.__version__,'transformers',transformers.__version__)" 2>&1 | tail -1
 
 SERVER_LOG="$RUN_DIR/server.log"
@@ -33,12 +40,11 @@ nsys --version
 
 QWEN_MODEL_ARGS="--model-provider gpt --num-layers 48 --hidden-size 2048 --ffn-hidden-size 6144 --num-attention-heads 32 --group-query-attention --num-query-groups 4 --kv-channels 128 --num-experts 128 --moe-router-topk 8 --moe-ffn-hidden-size 768 --moe-grouped-gemm --moe-router-dtype fp32 --moe-router-pre-softmax --moe-token-dispatcher-type alltoall --swiglu --normalization RMSNorm --norm-epsilon 1e-6 --position-embedding-type rope --rotary-base 1000000 --qk-layernorm --disable-bias-linear --untie-embeddings-and-output-weights --no-gradient-accumulation-fusion --make-vocab-size-divisible-by 1187 --tensor-model-parallel-size 1 --pipeline-model-parallel-size 1 --expert-model-parallel-size 4 --expert-tensor-parallel-size 1 --inference-moe-token-dispatcher-type nvls --inference-grouped-gemm-backend vllm"
 
-# Launch server UNDER nsys. --cuda-graph-trace=node traces kernels inside the
-# full_iteration_inference CUDA graph. trace=cuda,nvtx only (no osrt) to bound size.
+# Launch server UNDER nsys. trace=cuda,nvtx only (no osrt) to bound size.
 nsys profile \
   --trace=cuda,nvtx \
   --sample=none --cpuctxsw=none \
-  --cuda-graph-trace=node \
+  --cuda-graph-trace="$CUDA_GRAPH_TRACE" \
   --force-overwrite=true \
   -o "$PROF_BASE" \
   $PYBIN -m torch.distributed.run --nproc-per-node 4 --log-dir "$RUN_DIR/torchrun_logs" \
@@ -93,9 +99,45 @@ $PYBIN -u tests/performance_tests/client/static_benchmark.py \
   --num-iters 1 --num-warmup-iters 0 2>&1 | tee "$RUN_DIR/profile_bench.log"
 
 echo "===== stopping nsys ====="
+# nsys finalization can deadlock (both CLI and agent parked in futex_wait) after
+# the target exits, so never `wait` unbounded here: that burns the whole
+# allocation and leaves a 0-byte report. Bound the wait, then recover offline
+# from the intermediate .qdstrm, which holds the full stream either way.
+STOP_TIMEOUT="${NSYS_STOP_TIMEOUT:-900}"
 kill -INT $NSYS_PID 2>/dev/null || true
-wait $NSYS_PID 2>/dev/null || true
+STOPPED=0
+for i in $(seq 1 "$STOP_TIMEOUT"); do
+  if ! kill -0 $NSYS_PID 2>/dev/null; then STOPPED=1; break; fi
+  sleep 1
+done
+if [[ "$STOPPED" == "1" ]]; then
+  wait $NSYS_PID 2>/dev/null || true
+  echo "NSYS_EXITED_CLEANLY=1"
+else
+  echo "NSYS_STOP_TIMEOUT after ${STOP_TIMEOUT}s (pid $NSYS_PID still alive) — will recover from qdstrm"
+fi
 ls -la "$RUN_DIR"/mcore_profile.* || true
+
+if [[ ! -s "$PROF_BASE.nsys-rep" ]]; then
+  echo "===== recovering report from intermediate qdstrm ====="
+  rm -f "$PROF_BASE.nsys-rep"
+  QDSTRM=$(ls -t "${TMPDIR:-/tmp}"/nsys-root/nsys-report-*.qdstrm /tmp/nsys-root/nsys-report-*.qdstrm 2>/dev/null | head -1)
+  if [[ -z "$QDSTRM" ]]; then
+    echo "ERROR: no intermediate qdstrm found; trace is unrecoverable"; exit 4
+  fi
+  echo "QDSTRM=$QDSTRM ($(stat -c %s "$QDSTRM") bytes)"
+  cp "$QDSTRM" "$PROF_BASE.qdstrm"
+  NSYS_ROOT=$(dirname "$(dirname "$(readlink -f "$(command -v nsys)")")")
+  IMPORTER=$(ls "$NSYS_ROOT"/host-linux-*/QdstrmImporter 2>/dev/null | head -1)
+  if [[ -z "$IMPORTER" ]]; then
+    echo "ERROR: QdstrmImporter not found under $NSYS_ROOT"; exit 4
+  fi
+  # Run through the importer's own lib dir; its $ORIGIN rpath is unreliable here.
+  LD_LIBRARY_PATH="$(dirname "$IMPORTER"):${LD_LIBRARY_PATH:-}" \
+    "$IMPORTER" --input-file "$PROF_BASE.qdstrm" || { echo "ERROR: QdstrmImporter failed"; exit 4; }
+  kill -9 $NSYS_PID 2>/dev/null || true
+fi
+
 echo "===== exporting sqlite ====="
 nsys export --type sqlite --force-overwrite=true --output "$PROF_BASE.sqlite" "$PROF_BASE.nsys-rep"
 ls -la "$PROF_BASE.sqlite"

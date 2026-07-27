@@ -35,7 +35,8 @@ export CHECKPOINT_LOAD_PATH="$CKPT"
 VENV=/lustre/fsw/portfolios/coreai/users/shanmugamr/agents-space/envs/megatron_lm/dd356431262b5db4/.venv
 PYBIN=$VENV/bin/python
 
-RUN_DIR=/lustre/fsw/portfolios/coreai/users/shanmugamr/agents-space/sessions/qwen-opt/e2e/${TAG}-$(date +%s)
+SESSION_HANDLE="${SESSION_HANDLE:-qwen-cutlass2}"
+RUN_DIR=/lustre/fsw/portfolios/coreai/users/shanmugamr/agents-space/sessions/${SESSION_HANDLE}/e2e/${TAG}-$(date +%s)
 mkdir -p "$RUN_DIR/torchrun_logs"
 EXTRA="$RUN_DIR/extra_pkgs"; mkdir -p "$EXTRA"
 export PYTHONPATH="$EXTRA:${PYTHONPATH:-}"
@@ -46,6 +47,8 @@ BENCH_LOG="$RUN_DIR/benchmark.log"
 echo "================ CONFIG ($TAG) ================"
 echo "ASYNC_SCHED=$ASYNC_SCHED SAMPLING_BACKEND=$SAMPLING_BACKEND NUM_CUDA_GRAPHS=$NUM_CUDA_GRAPHS CG_SIZING=$CG_SIZING HISTO_COUNT=$HISTO_COUNT DISPATCHER=$DISPATCHER GEMM_BACKEND=$GEMM_BACKEND OSL=$OSL"
 echo "EXTRA_SERVER_ARGS=$EXTRA_SERVER_ARGS CUDA_DEVICE_MAX_CONNECTIONS=$CUDA_DEVICE_MAX_CONNECTIONS"
+echo "MCORE_FUSE_FC1_ACT=${MCORE_FUSE_FC1_ACT:-<unset:default1>} MCORE_MOE_FUSED_ALIGN=${MCORE_MOE_FUSED_ALIGN:-<unset:default0>} MCORE_MOE_GEMM_TUNE=${MCORE_MOE_GEMM_TUNE:-<unset:default0>}"
+echo "MCORE_NVLS_AGV_CTAS=${MCORE_NVLS_AGV_CTAS:-<unset:lib128>} MCORE_NVLS_RSV_CTAS=${MCORE_NVLS_RSV_CTAS:-<unset:lib128>}"
 echo "RUN_DIR=$RUN_DIR"
 echo "==============================================="
 

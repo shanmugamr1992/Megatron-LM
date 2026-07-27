@@ -1,0 +1,32 @@
+#!/usr/bin/env bash
+# ssh shim: drop cog's ControlMaster/ControlPersist/ControlPath options.
+#
+# cog hardcodes `-o ControlMaster=auto -o ControlPath=~/.ssh/cm-%C` and appends
+# COG_SSH_OPTS *after* them, but ssh uses the FIRST value obtained for each
+# option, so the env var cannot override them. On macOS the multiplexed
+# connection dies on cog's large payloads ("mm_send_fd: sendmsg(1): Message too
+# long"), which hangs the workspace tar upload. Putting this directory first on
+# PATH forces every cog ssh call onto a plain, unmultiplexed connection.
+args=()
+skip_next=0
+for a in "$@"; do
+  if [[ $skip_next == 1 ]]; then skip_next=0; continue; fi
+  if [[ "$a" == "-o" ]]; then
+    skip_next=-1
+    args+=("$a")
+    continue
+  fi
+  if [[ $skip_next == -1 ]]; then
+    skip_next=0
+    case "$a" in
+      ControlMaster=*|ControlPersist=*|ControlPath=*)
+        unset 'args[${#args[@]}-1]'   # drop the dangling -o
+        continue
+        ;;
+    esac
+    args+=("$a")
+    continue
+  fi
+  args+=("$a")
+done
+exec /usr/bin/ssh -o ControlPath=none "${args[@]}"

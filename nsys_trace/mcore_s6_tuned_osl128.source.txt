@@ -1,0 +1,4 @@
+session:   qwen-comm
+prof dir:  /lustre/fsw/portfolios/coreai/users/shanmugamr/agents-space/sessions/qwen-comm/prof/s6-all-1785028240
+host:      oci-hsg-cs-001-login-02.nvidia.com
+fetched:   2026-07-26T05:49:03Z

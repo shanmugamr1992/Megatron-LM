@@ -1,0 +1,3 @@
+# Large nsys trace binaries — keep out of git; only runs.md is tracked.
+*.nsys-rep
+*.sqlite
