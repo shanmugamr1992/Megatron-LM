@@ -5,6 +5,7 @@ from typing import Optional, Union
 
 import torch
 
+from megatron.core.inference.moe.router_topk import can_use_fused_softmax_topk, fused_softmax_topk
 from megatron.core.inference.utils import InferenceMode
 from megatron.core.jit import jit_fuser
 from megatron.core.transformer.module import MegatronModule
@@ -816,6 +817,19 @@ class InferenceTopKRouter(TopKRouter):
 
     def _forward(self, input: torch.Tensor, padding_mask: Optional[torch.Tensor] = None):
         logits = self.gating(input).squeeze(1)  # [num_tokens, num_experts]
+
+        if can_use_fused_softmax_topk(
+            logits,
+            self.topk,
+            use_pre_softmax=self.config.moe_router_pre_softmax,
+            num_groups=self.config.moe_router_num_groups,
+            group_topk=self.config.moe_router_group_topk,
+            scaling_factor=self.config.moe_router_topk_scaling_factor,
+            score_function=self.score_function,
+            expert_bias=self.expert_bias,
+            router_replay=self.router_replay,
+        ):
+            return fused_softmax_topk(logits, self.topk)
 
         probs, top_indices = self._compiled_topk_routing(
             logits,
