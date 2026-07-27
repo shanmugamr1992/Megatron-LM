@@ -1,0 +1,15 @@
+mcore-final-jul27 — final optimized mcore config (all ten gates on)
+
+Fetched: 2026-07-27
+Cluster: oci-hsg (OCI, 1x4 GB200)
+Session: qwen-updreq
+Slurm job: 5616264
+Remote run dir:
+  /lustre/fsw/portfolios/coreai/users/shanmugamr/agents-space/sessions/
+  qwen-updreq/prof/g2-on-1785107105
+Remote files: mcore_profile.nsys-rep (120 MB), mcore_profile.sqlite (345 MB)
+Captured by: dev/moe_fused/profile_insession.sh (GPU-only: cuda,nvtx)
+
+This is the gate-ON arm of the QWEN-025 OSL128 A/B pair; its gate-OFF partner
+is prof/g2-off-1785106875. Ledger record: QWEN-025 in
+skills/run-qwen-model/EXPERIMENTS.md.

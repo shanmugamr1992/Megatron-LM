@@ -16,6 +16,8 @@ each captured **under Nsight Systems at BS=256, OSL=1024** on a single OCI
 | `mcore_s6_tuned_osl128.sqlite`    | same, exported SQLite |
 | `mcore_host_s6_osl128.nsys-rep`   | mcore session-6 config with **host visibility** (osrt + CPU sampling) |
 | `mcore_host_s6_osl128.sqlite`     | same, exported SQLite (5.9 GB) |
+| `mcore-final-jul27.nsys-rep`      | mcore **final optimized config**, all ten gates (see below) |
+| `mcore-final-jul27.sqlite`        | same, exported SQLite (345 MB) |
 
 > The `.nsys-rep` / `.sqlite` binaries are large and are git-ignored via
 > `nsys_trace/.gitignore`; only this `runs.md` is tracked. Each fetched trace
@@ -29,7 +31,37 @@ dev/moe_fused/fetch_profile.sh <session> <prof-dir|latest> <dest-basename>
 # e.g. dev/moe_fused/fetch_profile.sh qwen-comm s6-all-1785028240 mcore_s6_tuned_osl128
 ```
 
-## `mcore_s6_tuned_osl128` — current best config (PROFILE-S6)
+## `mcore-final-jul27` — final optimized config, all ten gates
+
+The end state of the July optimization campaign: every accepted lever enabled,
+at the fixed profile protocol (BS=256, **OSL=128**), so it is directly
+comparable to `mcore_s6_tuned_osl128` but *not* to the OSL1024 baselines.
+
+- Session `qwen-updreq`, Slurm job `5616264`, run dir
+  `sessions/qwen-updreq/prof/g2-on-1785107105`. Captured by
+  `dev/moe_fused/profile_insession.sh`.
+- All ten gates on — the seven of `mcore_s6_tuned_osl128` plus
+  `MCORE_INFER_INCR_ATTN_STATE=1 MCORE_INFER_VEC_UPDATE_REQS=1
+  MCORE_INFER_FAST_POST_PROCESS=1`.
+- This is the **gate-ON arm of the QWEN-025 A/B pair**; its gate-OFF partner is
+  `sessions/qwen-updreq/prof/g2-off-1785106875`, which is the trace to diff
+  against for the last lever's effect.
+- Corresponding un-profiled throughput at OSL1024 is **26,430.7 tok/s**
+  (77.75% of the vLLM baseline). The 11,159 tok/s in this run's
+  `profile_bench.log` is the OSL128-under-nsys number and is not comparable.
+- 1,862,685 kernels across all 4 ranks, 124.6 s span, `pragma quick_check` ok.
+- **GPU-only trace**: `CUPTI_ACTIVITY_KIND_RUNTIME` and NVTX are present,
+  `OSRT_API` and the sampling tables are not. Host gaps show up as idle time
+  here but cannot be attributed to call sites from this file.
+- Ledger record: `QWEN-025` in `skills/run-qwen-model/EXPERIMENTS.md`.
+
+> Known open question in this trace: residual G1 is ~499 µs/step while the
+> entire *measured* host bookkeeping chain is down to 148 µs/step, so most of
+> G1 is no longer the bookkeeping chain and has not been isolated. Attributing
+> it needs a host-visibility capture, which failed three times in nsys
+> finalization on 2026-07-26 (see the recovery notes at the end of this file).
+
+## `mcore_s6_tuned_osl128` — earlier best config (PROFILE-S6)
 
 Captured at the fixed **profile** protocol (BS=256, **OSL=128**), so it is not
 comparable to the OSL1024 baselines above; it is the trace behind the
