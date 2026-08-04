@@ -3211,6 +3211,101 @@ launch count (916 against 810) and packing: the overlap ratio is 1.008x against 
 dominated by profiler-inflated host work on both sides and cannot be compared across
 traces captured with different `--cuda-graph-trace` settings.
 
+### QWEN-047 — the collectives re-priced in place: latency-bound, exposed, unhideable without microbatching
+
+Session 21 opened by re-pricing every per-layer component with the in-graph external-event
+timer (`MCORE_INSITU_TIMING=1` plus `MCORE_INFER_STEP_GPU_TIMING=1`, which is what actually
+drives the report — the timer alone prints nothing). Motivation: the trace analysis had put
+~0.3 ms on matching vLLM's overlap ratio, but that measurement predated the bf16
+reduce-scatter, which halved the combine's bytes on the wire.
+
+Per-layer, scaled x48, net of the calibrated 2.2 us/pair event overhead:
+
+| component | ms/step | component | ms/step |
+|---|---:|---|---:|
+| expert_gemm_fc1 | 1.650 | nvls_dispatch | 0.491 |
+| expert_gemm_fc2 | 1.183 | qkv_proj | 0.482 |
+| attn_core | 1.152 | moe_align | 0.449 |
+| nvls_combine | 0.548 | moe_sum | 0.321 |
+| out_proj | 0.533 | router_topk | 0.253 |
+| | | **SUM of sites** | **7.060** |
+
+Two results, both load-bearing.
+
+**The collectives are latency-bound, not bandwidth-bound.** Dispatch plus combine is
+1.039 ms/step against 1.035 ms measured before bf16 halved the combine's bytes — a 0.4%
+move for a 2x reduction in traffic. With `QWEN-016`'s CTA-count result and the barrier
+finding, that is now three independent measurements saying the same thing: **these
+collectives cannot be made faster, only hidden.** Do not spend another session on the
+transport.
+
+**The block is a serial chain, confirmed a second way.** Sites sum to 7.060 ms against a
+block total of ~7.09 — about 100%. Parts can only reconstruct the whole like that if
+nothing overlaps, which independently corroborates the trace-derived 1.008x overlap ratio
+using a completely different instrument.
+
+**Why the 1.04 ms is not collectable today.** Hiding it needs a second, independent stream
+of work to hide it behind, and inside a layer everything is strictly dependent: attention
+feeds the router, the router feeds dispatch, the all-gather *sizes* the expert GEMM (see
+`floor_ablation.py`), and the GEMM feeds combine. The standard remedy is two interleaved
+microbatches. The inference decode path has no such machinery — the only overlap primitive
+there is the shared-expert stream, and Qwen3-30B-A3B has no shared expert, so that lever is
+empty. **Dual-batch overlap is the single largest remaining prize (1.04 ms exposed against
+a 0.82 ms gap) and it is an architecture project, not a tuning session.**
+
+One trap avoided: the same report shows 0.78 ms/step (9.8%) outside the block graph, which
+looks like a fresh target and is not. It is the bucket already measured at 0.59 ms and
+**quantitatively retired** — embedding, logits GEMM, sampling, bookkeeping and every host
+gap — whose links form a true serial dependency (`graph(N) -> logits -> argmax -> D2H ->
+update_requests -> initialize_attention_state(N+1) -> H2D -> graph(N+1)`). Flashinfer
+sampling, the obvious lever there, is `QWEN-004`: it crashes under `full_iteration_inference`
+capture. Check the ledger before re-opening anything outside the block.
+
+### QWEN-048 — route-mask fusion: the hang is fixed, the win is inside the noise
+
+`QWEN-046` left this implemented-but-hanging with a measured +1.02% ablation ceiling. The
+retry skipped straight to rung 3 of that entry's diagnostic ladder rather than working up
+it, because duplicating the kernel *eliminates* the leading suspect instead of testing it:
+`_softmax_topk_mask_kernel` is now a separate `@triton.jit` function and
+`_softmax_topk_kernel` is byte-identical to before, so the gate-off path provably cannot
+have changed. **That fixed the hang** — the gate-off arm, which is what hung in
+`QWEN-046`, now runs normally. The cause was therefore the constexpr branch in the shared
+kernel, not the publish or the skip.
+
+Correctness (`dev/moe_fused/harness_routemask.py`, run with the venv interpreter and
+`PYTHONPATH` set, or it cannot import megatron): indices bit-exact and probs delta 0.000e+00
+at real counts 256/200/137/1/0, padding rows all -1.
+
+Throughput did not follow. Two back-to-back pairs disagreed in sign:
+
+| pair | gate off | gate on | delta |
+|---|---:|---:|---:|
+| 1 | 30,412.1 | 30,816.5 | **+1.33%** |
+| 2 | 30,564.2 | 30,347.1 | **-0.71%** |
+
+Four runs span 30,347-30,817 with the treatment at both extremes, which looked like a noise
+floor as large as the effect. Six more alternating pairs (`s1a`..`s6b`, gate off then on,
+one server start each) resolved it:
+
+| | n | delta | | t |
+|---|---:|---:|---:|---:|
+| 6 alternating pairs | 6 | **+224.5 +/- 44.7 tok/s** | **+0.74%** | 5.02 |
+| all 8 pairs | 8 | +191.8 +/- 70.6 tok/s | +0.63% | 2.72 |
+
+**Accepted: +0.74%** (p ~ 0.004), landing just under the +1.02% ablation ceiling, which is
+the right shape — the fused kernel still does the compare and the select that the standalone
+launch was doing, it just stops paying for a launch to do it.
+
+The noise diagnosis was itself wrong, and correcting it changes how future A/Bs here should
+be read. Gate-off across all 8 runs has sd **51.2 tok/s (0.17%)** — the baseline is extremely
+reproducible. Gate-on has sd 183.2, but that is one anomalous run (30,347, the lowest of all
+16, the `rmask2` that produced the -0.71%); the other seven average 30,750.9 with a tight
+spread. So this node is *not* broadly noisy: it produces an occasional bad server start,
+roughly 1 in 16. **A single outlier start, not a wide distribution, is what makes
+single-pair A/Bs unsafe here.** Alternate arms and read the paired t, or one bad start will
+invert the sign of any sub-1% result.
+
+Level after this change: **~30,751 tok/s, 90.5% of vLLM.**
 
 ## Optimization rules
 
