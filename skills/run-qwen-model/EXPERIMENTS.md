@@ -3307,6 +3307,79 @@ invert the sign of any sub-1% result.
 
 Level after this change: **~30,751 tok/s, 90.5% of vLLM.**
 
+### QWEN-049 — dual-batch overlap is the wrong technique for a latency-bound decode
+
+`QWEN-047` left DBO as the largest remaining prize (1.04 ms exposed against a 0.82 ms
+gap). A full architecture map of the decode path plus an economic check says **do not
+build it.**
+
+**What it would cost.** The decode path is single-microbatch at three independent levels.
+(1) One `DynamicInferenceContext` owns every fixed-address buffer the graph reads; nothing
+is replicated per request, only indexed. (2) Graphs are keyed on the *identity* of that
+context object (`ArgMetadata` stores non-tensors by value, `cuda_graphs.py:256`), so a
+second context needs its own captured graph set. (3) The NVLS dispatcher keeps its
+symmetric buffers and `_step_metadata` at **class** level, and the barrier
+(`torch_symm_triton/barrier.py:65`) is a per-(block, sender) mailbox with no sequence
+number, so two concurrent collectives sharing a handle either false-pass into silent
+corruption or lose a token and hang.
+
+**Why it would not pay even if built.** Take `BSSCALE-S13`: step(128) = 7.140 ms,
+step(256) = 9.151 ms, with a ~5.03 ms batch-independent floor. Splitting 256 into two 128s
+doubles the count of every latency-bound operation, and the collectives are latency-bound,
+so the comm to hide goes from 1.04 ms to 2.08 ms. Best case is
+floor + 2 x marginal(128) = 5.03 + 4.22 = **9.25 ms against today's 9.15**. DBO hides
+communication behind long GEMMs in a *compute-bound* regime; this decode is latency-bound,
+so halving the batch costs about what the overlap returns.
+
+**And it was already gated out.** `QWEN-016` priced the whole lever: recoverable critical
+path 6.4-7.0%, 2-chunk pipelining 4.3% best case, concurrent streams under graph capture
+identified as the binding constraint, and a CTA sweep showing 128 is already optimal so
+freeing SMs by shrinking the collective's grid is strictly worse. Its recorded next action
+was "redirect off this lever". **Read QWEN-016 before touching comm overlap again.**
+
+### QWEN-050 — EP expert-load imbalance is real and worth nothing
+
+A promising-looking lever, killed by direct measurement. Recorded in full because the
+causal story was strong and still wrong.
+
+**The evidence for it.** A 127M-assignment histogram (`expert_histogram.py`, new) shows
+expert popularity is uneven and does not average out within a rank's contiguous block:
+loads are **+6.9% / -2.9% / +2.1% / -6.1%** of the mean. In-situ timing appears to show
+the barrier absorbing exactly that — per layer rank 0 spends 63.0 us in the expert GEMM
+and 28.2 us in the collectives, rank 1 spends 56.8 and 34.5, and *both sum to 91.2*. The
+rank ordering of GEMM time matches the histogram ordering exactly. An equal-cardinality
+greedy partition takes the worst rank from +6.9% to +0.1%, so on the "critical path is the
+busiest rank" model the prize is (max - mean) = 4.85 us/layer = 233 us/step = **2.8%**.
+
+**The measurement.** Permuting only the router's gating weight was the cheap probe, and it
+**hangs** — it leaves expert weights in place, so numerics degrade, logits degenerate,
+routing collapses onto a few experts and blows the per-rank token capacity. *A probe that
+corrupts numerics cannot rely on data-dependent routing.* The fix is to make routing not
+depend on numerics at all: `synthetic_routing.py` (new) substitutes a fixed index tensor
+with a chosen per-rank split, so both arms have equally invalid numerics and differ only
+in load distribution.
+
+| arm | per-rank split | tok/s |
+|---|---|---:|
+| `skew` | +5.9 / -2.2 / +2.6 / -6.2% | 29,656.4 |
+| `balanced` | -0.6 / -0.3 / +0.4 / +0.5% | 29,583.7 |
+
+**Removing the entire imbalance is worth -0.25%, i.e. nothing.** A 2.8% effect would have
+been ~830 tok/s, far outside any noise here, so one pair is enough to reject it.
+
+**Why the causal story failed.** The GEMM/collective anti-correlation is the barrier
+equalizing the ranks, and that is exactly why rebalancing cannot help: it moves work
+between ranks whose totals are *already* equalized, without shortening the thing that sets
+the total. The binding constraint is the collective latency floor, not expert work. Note
+also that several sites split cleanly along r0,r1 vs r2,r3 (`nvls_dispatch` 14.9/14.8 vs
+10.2/10.1, `router_topk` 3.8/3.8 vs 5.3/5.2) — that is a two-superchip topology signature,
+plus a per-rank calibration difference (2.2 vs 2.6-2.7 us/pair), and I initially read part
+of it as load imbalance. **Per-rank in-situ deltas conflate load, topology and calibration;
+do not attribute them to load without an independent load measurement.**
+
+Both diagnostics are kept, gated off: `MCORE_EXPERT_HISTOGRAM` and `MCORE_SYNTH_ROUTING`.
+
+
 ## Optimization rules
 
 1. Profile and classify before proposing a code change.
