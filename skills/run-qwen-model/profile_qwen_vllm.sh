@@ -36,6 +36,7 @@ ssh -o BatchMode=yes "$COG_SSH_HOST" "mkdir -p '$EXP'; cat > '$EXP/vllm_nsys.sba
 #SBATCH --job-name=vllm-qwen30b-nsys
 #SBATCH --account=$ACCOUNT
 #SBATCH --partition=$PART
+#SBATCH --qos=${SLURM_QOS:-short}
 #SBATCH --nodes=1
 #SBATCH --ntasks-per-node=1
 #SBATCH --gres=gpu:4

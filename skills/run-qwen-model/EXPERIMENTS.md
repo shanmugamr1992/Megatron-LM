@@ -50,7 +50,7 @@ Baseline order is mandatory:
 | MCORE-BASELINE | 2026-07-22 | Establish the fixed EP4 starting point | `max_requests=256` | 12,346.1 | baseline | Benchmark pass | 5553135 | Starting point established |
 | QWEN-001 | 2026-07-22 | Single-kernel FC1+SwiGLU+FC2+topk-reduce mega-fusion beats the 4-kernel vLLM MoE path | `megatron/core/inference/moe/fused_moe_decode.py` (new), `dev/moe_fused/harness.py` (new) | microbench only | n/a (0.68–0.80× kernel) | Numerics pass (max_abs 2.6e-5, allclose) | session `qwen-moe-kernel` | Rejected — fused kernel 20–50% slower than reference; not integrated |
 | QWEN-002 | 2026-07-22 | Fusing SiLU(gate)*up into the FC1 GEMM epilogue (removing bounded_silu_mul + the 2N round-trip) speeds up the decode MoE path without hurting FC2 tiling | `vllm_fused_moe.py` (FUSE_SWIGLU), `experts.py` (`fuse_fc1_activation=True`), `dev/moe_fused/harness_fc1.py`, `dev/moe_fused/run_e2e_insession.sh` (new) | **22,741.9 tok/s** (OSL1024) | **+0.55%** vs same-env fusion-off (22,617.7) | Coherent + numerics (max_abs 3.9e-5) | session `qwen-moe-kernel` in-session A/B | Accepted — MoE path 1.25×, e2e +0.55% throughput / −0.55% TPOT, no regression |
-| PROFILE-OSL1024 | 2026-07-22 | Re-profile at the real throughput regime (BS256/OSL1024) to find the true vLLM→mcore gap and the dominant decode bottleneck | none (profiling only); `dev/moe_fused/profile_insession.sh` (new), `dev/moe_fused/vllm_osl1024_tput.sbatch` (new) | vLLM **33,994.5** vs mcore **~22,700** tok/s | mcore = **66.8%** of vLLM (**vLLM 1.50×**) | Both coherent | vLLM job `5555787` (tput) + `5555868` (nsys); mcore in-session `prof256a` | Gap is real & large at OSL1024. mcore decode: GPU 79% busy; MoE grouped-GEMM 41%, attn 22%, MoE routing 12% (49k tiny kernels), **exposed EP comm 11.5%**, norm/elt 10%, GPU idle 21%. vLLM uses TRT-LLM fused MoE (1-kernel routing + cutlass bmm + fused finalize, **0 exposed comm**). Next target: routing-kernel storm + exposed EP comm (pending approval) |
+| PROFILE-OSL1024 | 2026-07-22 | Re-profile at the real throughput regime (BS256/OSL1024) to find the true vLLM→mcore gap and the dominant decode bottleneck | none (profiling only); `dev/moe_fused/profile_insession.sh` (new), `dev/moe_fused/vllm_osl1024_tput.sbatch` (new) | vLLM **33,994.5** vs mcore **~22,700** tok/s | mcore = **66.8%** of vLLM (**vLLM 1.50×**) | Both coherent | vLLM job `5555787` (tput) + `5555868` (nsys); mcore in-session `prof256a` | Gap is real & large at OSL1024. mcore decode: GPU 79% busy; MoE grouped-GEMM 41%, attn 22%, MoE routing 12% (49k tiny kernels), **exposed EP comm 11.5%**, norm/elt 10%, GPU idle 21%. vLLM uses TRT-LLM fused MoE (1-kernel routing + cutlass bmm + fused finalize, ~~0 exposed comm~~ — **comm claim falsified, see VLLM-COMM-S16**). Next target: routing-kernel storm + exposed EP comm (pending approval) |
 | SESSION2-BASE | 2026-07-23 | Re-establish clean OSL1024 baseline in fresh session `qwen-opt` (fusion on, histogram off) before autonomous optimization campaign | none (config = current best) | **22,398.9 tok/s** | baseline for session 2 (−1.5% vs QWEN-002 run, within variance) | Coherent | session `qwen-opt` run `e2ebase` | Clean reference; 65.9% of vLLM 33,994.5 |
 | QWEN-003 | 2026-07-23 | Replacing per-pair `atomic_add` in the MoE local-token count kernel with a `tl.histogram` variant (one atomic/bin/CTA) cuts the routing-kernel cost | `permute.py` (`_count_local_tokens_kernel_histogram`, env `MCORE_MOE_HISTOGRAM_COUNT`), `dev/moe_fused/harness_count.py` (new) | microbench only | **0.96× (wash)** | **EXACT integer match** vs reference | session `qwen-opt` `harness_count.py` | Rejected — count-kernel cost is per-launch fixed overhead, not atomic contention; in-kernel rewrite can't help. Default OFF. Real lever = fewer launches + less host-scheduling idle |
 | QWEN-004 | 2026-07-23 | flashinfer sampling backend is faster than torch sampling | `run_e2e_cfg.sh` (`--inference-dynamic-batching-sampling-backend flashinfer`) | server crash | n/a | n/a | session `qwen-opt` `flashinfer` | Rejected — incompatible with `full_iteration_inference` CUDA graph capture: `RuntimeError: Generator not registered with the capturing graph` in `flashinfer.sampling`. torch sampling stays. |
@@ -61,7 +61,7 @@ Baseline order is mandatory:
 | QWEN-008 | 2026-07-23 | `CUDA_DEVICE_MAX_CONNECTIONS=8` (was hardcoded 1) lets comm & compute overlap on separate HW queues, hiding exposed NVLS comm | `run_e2e_cfg.sh` (env override) | **~22,556 tok/s** | **~flat (noise)** | Coherent | session `qwen-opt` `maxconn8` | Reject — overlap is bounded by the full-iteration CUDA-graph structure / data deps, not connection count. No effect. |
 | QWEN-010 | 2026-07-23 | `torch` grouped-GEMM backend (`torch.nn.functional.grouped_mm`, cuBLAS) beats the vLLM Triton fused-MoE backend on GB200 | `run_e2e_cfg.sh` (`--inference-grouped-gemm-backend torch`) | **18,434 tok/s** | **0.82× (worse)** | Coherent | session `qwen-opt` `gemmtorch` | Rejected — vLLM Triton backend stays best. (`flashinfer` cutlass backend is blocked for SwiGLU; only torch/vllm allowed.) All three backends now evaluated → vLLM is optimal. |
 | QWEN-009 | 2026-07-23 | Built-in `--moe-router-fusion` (TE fused softmax+topk) + `--moe-permute-fusion` cut the routing critical path (~18%) | `run_e2e_cfg.sh` EXTRA_SERVER_ARGS | server crash | n/a | n/a | session `qwen-opt` `routperm`/`routfus` | Rejected — both crash: `AssertionError: hidden_size mismatch: 128 vs 8`. TE fused router emits a dense **128-expert** routing map, but `InferenceTopKRouter` (transformer_impl=inference_optimized) uses a dense **top-8** contract for the vLLM/nvls dispatcher. The built-in fusions are wired to the training MoE path only. A hand-written fused softmax+topk would need to honor the top-8 inference contract. |
-| PROFILE-DECODE | 2026-07-23 | Get the TRUE per-step decode bottleneck (prior OSL256 totals were prefill-contaminated) | analysis of archived `mcore_osl256.sqlite`, pure-decode window (t0+220s, big-dispatch-free) | n/a | n/a | n/a | local sqlite | **Corrected model** (decode GPU-time share): MoE grouped-GEMM (`_fused_moe_kernel`) **~40% #1**, routing (count/moe_sum/topk/scatter/softmax/meta) ~18%, exposed comm (dispatch 122k + combine 320k) ~16%, attention ~13%, norm/elt ~10%. Kernels overlap across streams → **wall = per-layer critical path** (attn→router→dispatch→GEMM→combine). vLLM wins via TRT-LLM fused MoE (0 exposed comm, fused routing+finalize). Explains QWEN-002 1.25× kernel → +0.55% e2e. |
+| PROFILE-DECODE | 2026-07-23 | Get the TRUE per-step decode bottleneck (prior OSL256 totals were prefill-contaminated) | analysis of archived `mcore_osl256.sqlite`, pure-decode window (t0+220s, big-dispatch-free) | n/a | n/a | n/a | local sqlite | **Corrected model** (decode GPU-time share): MoE grouped-GEMM (`_fused_moe_kernel`) **~40% #1**, routing (count/moe_sum/topk/scatter/softmax/meta) ~18%, exposed comm (dispatch 122k + combine 320k) ~16%, attention ~13%, norm/elt ~10%. Kernels overlap across streams → **wall = per-layer critical path** (attn→router→dispatch→GEMM→combine). vLLM wins via TRT-LLM fused MoE (fused routing+finalize; the ~~0 exposed comm~~ half is **falsified, see VLLM-COMM-S16**). Explains QWEN-002 1.25× kernel → +0.55% e2e. |
 | CLEANBASE-S3 | 2026-07-24 | Fresh clean un-profiled OSL1024 baseline (SwiGLU fusion OFF) in session `qwen-fuse` before session-3 fusion campaign | none (`MCORE_FUSE_FC1_ACT=0`) | **22,241.5 tok/s** | baseline (session 3) | Coherent | session `qwen-fuse` `cleanbase` | Clean reference; 65.4% of vLLM un-profiled 33,994.5. avg_latency 11,494 ms |
 | QWEN-002-CONFIRM | 2026-07-24 | Re-measure QWEN-002 SwiGLU FC1-epilogue fusion (lever #3) cleanly at OSL1024 | `experts.py` (`MCORE_FUSE_FC1_ACT=1`), `vllm_fused_moe.py` FUSE_SWIGLU | **22,269.5 tok/s** | **+0.13% vs OFF** (wash) | Coherent | session `qwen-fuse` `qwen002on` | Confirms QWEN-002: MoE-kernel 1.25× but e2e wash at OSL1024 — FC1 activation is not the decode wall bottleneck. Kept on (free, exact). |
 | CLEANBASE-S4 | 2026-07-25 | Fresh clean un-profiled OSL1024 reference in session `qwen-cutlass2` at the session-3 best config, before the grouped-GEMM/cutlass campaign | none (`MCORE_MOE_FUSED_ALIGN=1 MCORE_FUSE_FC1_ACT=1`, vllm backend) | **22,657.7 tok/s** | baseline (session 4); −0.17% vs QWEN-011 (within drift) | Coherent | session `qwen-cutlass2` `ref0-1785010433` | Clean reference; 66.65% of vLLM un-profiled 33,994.5. avg_latency 11,282 ms, TPOT 11.299 ms/tok |
@@ -86,9 +86,60 @@ Baseline order is mandatory:
 | CGTRACE-CONTROL | 2026-07-26 | HOSTGAP-S6 could not tell whether the ~900 µs/step of CUDA-graph machinery (a 199 µs `cudaGraphLaunch` plus GPU-side inter-node dispatch) is real or an artifact of `--cuda-graph-trace=node` instrumenting all 1158 graph nodes. Capture the same workload both ways and compare | none (control); `dev/moe_fused/profile_insession.sh` (env `CUDA_GRAPH_TRACE`, plus the hardened nsys stop/qdstrm recovery ported from `profile_host_insession.sh`), `dev/moe_fused/analyze_cgtrace.py` (new) | n/a (two BS256/OSL128 profile runs) | n/a | n/a | session `qwen-attnstate` job 5613090, `prof/cgt-node-1785086713` and `prof/cgt-graph-1785086964` | **The machinery is real; node-mode instrumentation is not inflating the step.** Same rank, same steady-state decode window: step period **8882.5 µs (node) vs 8945.1 µs (graph)** — 0.71% apart and in the *wrong* direction for an instrumentation artifact — and host `cudaGraphLaunch` **190.0 vs 184.7 µs** (2.8%). Node mode traces 1169 kernels/step, matching PROFILE-S6's 1170. **HOSTGAP-S6's wall-time attributions therefore all stand**, and lever 4 (reduce graph node count, ~0.78 µs/node) is live rather than chasing a measurement artifact. Caveat: `CUPTI_ACTIVITY_KIND_GRAPH_TRACE` is too sparsely populated (417 rows total, n=6 in-window on the analyzed device) to independently confirm the *GPU-side* inter-node dispatch component; only the step period and host submit cost are settled |
 | HOSTGAP-S6 | 2026-07-26 | Attribute PROFILE-S6's three inter-kernel host gaps to concrete host functions using the recovered host-visibility trace | none (analysis); `dev/moe_fused/analyze_hostgaps.py` (new) | n/a (analysis) | n/a | n/a | session `qwen-host` job 5607600, `prof/hosts6-1785048883` | **All three gaps attributed; the largest is a true serial data dependency, not a scheduling artifact.** Per step (GPU-only trace, mean of 4 ranks, 9.134 ms step / 1965.7 µs idle): **G1 `index_elementwise`→`vectorized_elementwise` 571.4 µs** = `transfer_samples_to_cpu`+`active_request_mask`+`update_requests`+engine window+`initialize_attention_state`, **CPU-bound Python** (100% of samples Running in `_PyEval_EvalFrameDefault`, only 8.6% of the gap in CUDA API, 0.5% in `cudaStreamSynchronize`); **G2 `vectorized_elementwise`→`vectorized_gather` 331.0 µs in 2 instances** (267.9 µs inside `initialize_attention_state`+`transfer_bookkeeping_to_gpu`+`forward_pass` head, **CPU-bound Python**; 63.1 µs inside `sampling`, launch+`cudaStreamSynchronize`); **G3 `CatArrayBatchedCopy`→`rmsnorm_fwd` 305.4 µs** = **one `cudaGraphLaunch` costing 199.1 µs median** for a 1158-node graph (0.172 µs/node), driver-side, host Running in `cuGraphLaunch`. No rank asymmetry (≤4%). Idle splits **1065 µs real host Python (11.7% of step)** vs **900 µs graph machinery (9.9%)** that is `--cuda-graph-trace=node`-artifact-suspect. Async overlap cannot fix G1: the chain is data-dependent on the current step's sampled tokens, which explains QWEN-007's +0.85% |
 | QWEN-025 | 2026-07-26 | QWEN-024's decision-gate measurement showed 84% of `post_process_requests` is reducible by collapsing the per-request loop body — unvectorizable is not the same as irreducible. Add a decode fast path that is structurally unable to touch the request termination state machine | `dynamic_engine.py` (`_post_process_requests_decode_fast`, `_ppr_cache_epoch` invalidation at all three record-mutation sites, env `MCORE_INFER_FAST_POST_PROCESS`, `..._VERIFY`), `dev/moe_fused/harness_updreq.py` (`run_ppr_equivalence`, in-process gate A/B) | **26,361.7 tok/s** (three-pair ON mean); best run 26,430.7 | **+0.98%** vs same-session gate-OFF (pairwise +0.99% / +1.26% / +0.68%; +0.59% on a best-4-of-5 trim) | 400-step two-engine equivalence with 10 finisher steps and 200 steps past the token limit; 300 steps under VERIFY; coherence byte-identical | session `qwen-updreq` job 5616264, runs `e2e/ppr-{off,on}{,-r2,-r3}-*`, profiles `prof/g2-off-1785106875` and `prof/g2-on-1785107105` | **Accepted.** `post_process_requests` **211.0 → 27.2 µs/step (7.77×)**; whole post-sampling host chain **372.4 → 148.0 µs/step** across QWEN-024+025. The fast path **declines any step on which a request finishes**, so the termination state machine is unreachable from it — that is the safety argument, not extra testing. cProfile 261 calls/step vs the pre-registered <500 threshold. 13 of 15 ON iterations beat every one of the 15 OFF iterations. G1 −56.1 µs, idle −77.9 µs, kernels/step unchanged at 1169. **Only ~1/3–1/2 of the 183.9 µs host saving converts** (vs ~1:1 for QWEN-024) because `async_bookkeep` was already partly overlapped with GPU work. Default OFF. New best = **77.75%** of vLLM 33,994.5 |
+| PROFILE-S10 | 2026-07-27 | Re-profile at the twelve-gate config (ten gates + QWEN-026 + QWEN-027) and, for the first time this campaign, take a **clean 2 s decode window** (densest-window search, not a span fraction) to get an honest category breakdown and decide whether more small-kernel fusion is worth it | none (`profile_insession.sh` BS256/OSL256; `prof/s10-addnorm-1785188237/window_breakdown.py`, new) | n/a | n/a | n/a | session `qwen-nodecut`, `prof/s10-addnorm-1785188237/mcore_profile.{nsys-rep,sqlite}` | **Both fusions confirmed live and each removed ~48 kernels/step**: `rmsnorm_fwd_tuned` 104→56/step, `triton_poi_fused_add_copy` 103→55/step; `_fused_qk_rmsnorm` and `_fused_add_rmsnorm` each 55/step (1/layer). Clean-window (union-busy **81.6%**, idle **18.4%** = 360 µs-scale host gaps) device-time by category: **moe_expert_gemm 587 ms**, **comm/NVLS 247 ms**, **dense_gemm 236 ms**, **attention(flash) 211 ms**, routing 69, norm 67, elementwise 66, moe_sum 65, rope_kv 15. **Verdict: small-kernel fusion is now in diminishing returns.** The fusion-addressable buckets (norm/elementwise/routing) are each ~65-70 ms and partly overlapped on other streams, so each remaining fusion is ~0.5-1%; the gap to vLLM is now dominated by expert GEMM (compute-bound), NVLS comm, attention, and the 18.4% host idle (blocked on the nsys host-capture failure). Next levers should target those, not more small-kernel merges |
+| HOSTGAP-S10 | 2026-07-27 | With small-kernel fusion in diminishing returns (PROFILE-S10), attack the biggest remaining prize: the **18.4% GPU-idle**. Attribute it to host call sites **without** the deadlock-prone host-visibility capture, by using the CUDA-API host rows already in the clean `cuda,nvtx` trace | `idle_attrib2.py`, `bracket.py` (new, in `prof/s10-addnorm-*/`); env-gated `MCORE_INFER_NVTX` toggle added to `dynamic_engine.py`; `CUDA_GRAPH_TRACE` + `TRITON_LIBCUDA_PATH` + `HOST_LEVEL`/`OSRT`/`SAMPLE` knobs added to `profile_host_insession.sh` | n/a | n/a | n/a | traces on lustre `sessions/qwen-nodecut/prof/s10-addnorm-1785188237/`; session `qwen-host` (job 5638180) | **Idle decomposition (clean 1 s decode window, 178 ms idle):** small gaps <10 µs = 59.6 ms (33%, intra-graph kernel scheduling, unavoidable); **large gaps ≥10 µs = 118.8 ms (67%) = host chain between steps** (median 37 µs). Large-gap attribution via the decode thread's CUDA-API rows: **UNCOVERED (Python/CPU compute, no CUDA call) = 87.8 ms = 73.9%**, memcpy(token D2H) 8.9%, graph_launch 7.5%, launch 6.9%, sync_wait 1.6%. So ~74% of attackable idle (~8-9% of wall) is Python on the critical path. **Localized** by bracketing each Python gap with its surrounding CUDA APIs: 47.6% sits in `cudaMemcpyAsync -> cuKernelGetName`, +15.7% `cudaLaunchKernel -> cudaMemcpyAsync`, +11% `cuKernelGetName -> cudaMemcpyAsync` — i.e. the **between-steps host orchestration** after the sampled-token D2H copy (post-sampling bookkeeping / scheduling / attention-state prep), not the GPU-sync wait. **nsys dead-end recorded:** the host-visibility capture deadlocks nsys finalization and `QdstrmImporter` rejects the qdstrm whenever **osrt tracing**, **`--sample=process-tree`**, OR **`MCORE_INFER_NVTX` (NVTX ranges under CUDA graphs)** is on — independent of `--cuda-graph-trace` level. Only the plain `cuda,nvtx --sample=none` set finalizes. **Actionable conclusion:** future idle work should (a) use clean-trace RUNTIME attribution (this method), not host capture; (b) target the between-step Python orchestration via `perf_counter` phase timing (no nsys), since NVTX-based naming is blocked |
+| QWEN-027 | 2026-07-27 | PROFILE-S9 showed the two dominant small kernels are `triton_poi_fused_add_copy` (bias-dropout-add residual, 103/step) and `rmsnorm_fwd_tuned` (104/step), adjacent on the serial path. Fuse the residual-add with the *standalone* `pre_mlp_layernorm` (MoE) into one kernel (vLLM's `add+rms_norm`), returning both the updated residual and the normed MLP input — the input norm is inside the TE `LayerNormLinear` QKV GEMM and not interceptable, so only the pre-MLP boundary (48/step) is fusible | `megatron/core/inference/fused_add_rmsnorm.py` (new: `_fused_add_rmsnorm_kernel`, `fused_add_rmsnorm`, `can_use_fused_add_rmsnorm`), `megatron/core/transformer/transformer_layer.py` (guarded fused path at the `self_attn_bda` site + `_forward_pre_mlp_layernorm` consumes the stashed normed output), env `MCORE_FUSED_ADD_NORM`, `MCORE_FUSED_ADD_NORM_MAX_TOKENS` (default 256); `dev/moe_fused/harness_addnorm.py` (new) | **27,525.2 / 27,532.1 tok/s** (two runs, mean 27,528.6) | **+1.37%** vs QWEN-026-on 27,151.9; arms **fully separated** (min ON 27,503.6 > max ref 27,206.4) | **residual BIT-EXACT** (fp32-accumulate add reproduces torch's bf16 add), **norm bf16-ulp** (max_rel ≤7.9e-3 ≈ one bf16 ulp). Coherence: **all 3** temperature-0 prompts identical to the QWEN-026-on arm (incl. the France prompt that QWEN-026 flipped), fluent + factually correct | session `qwen-nodecut`, runs `e2e/addnorm-on-1785184454`, `e2e/addnorm-on-2-1785185287`; microbench, profile `prof/s9-qknorm-1785182903` | **Accepted.** Microbench CUDA-graph replay at 256 tokens: (add + TE norm) 6.16 → fused 4.11 µs (**1.50×**), and **2.0× at 384/512** — unlike QWEN-026 this kernel does not regress at higher token counts (flat ~4.1 µs). Removes 48 add launches + 48 graph nodes/step. Heavily gated: decode-only, MoE standalone RMSNorm, no bias/dropout/recompute/offload, no cross-attn, with a reference fallback so training and all non-matching cases are byte-identical. TPOT 9.428 → 9.299 ms/tok. Default OFF; `MCORE_FUSED_ADD_NORM=1`. New best = **80.98%** of vLLM 33,994.5 |
+| PROFILE-S9 | 2026-07-27 | Re-profile at the eleven-gate config (ten gates + QWEN-026) and re-rank the remaining small-kernel serial chain | none (`profile_insession.sh`, BS256/OSL256) | n/a | n/a | n/a | session `qwen-nodecut`, `prof/s9-qknorm-1785182903/mcore_profile.{nsys-rep,sqlite}` | **QWEN-026 confirmed live** (`_fused_qk_rmsnorm_kernel` 51.7/step = 1/layer; the old two `rmsnorm_fwd_general` are gone). The two dominant small kernels are now **`rmsnorm_fwd_tuned` 104/step @ 2.93 µs** (input + pre-MLP norm, 2/layer) and **`triton_poi_fused_add_copy` 103/step @ 1.51 µs** (the bias-dropout-add residual, 2/layer), and they are adjacent: the top consecutive pair by count is `triton_poi_fused_add_copy → rmsnorm_fwd_tuned` at 103/step. vLLM runs these as one `triton_red_fused__to_copy_add_..._rms_norm`; mcore runs them as two. **Next lever = fused add+RMSNorm** (~96 add-launches + 96 graph nodes/step removed, 4.44 → ~2.5 µs/boundary), the same convert-at-3× serial-chain + node-removal pattern QWEN-026 proved. Ranked #1 |
+| QWEN-026 | 2026-07-27 | Qwen attention applies `q_layernorm` and `k_layernorm` as two separate per-head RMSNorm module calls → two `rmsnorm_fwd_general` launches (and two graph nodes) per layer, each normalizing a tiny 128-wide row (launch/latency bound, not bandwidth). Fuse into one Triton kernel: one CTA per row over the concatenated `[q_rows; k_rows]` space, selecting the q or k gamma per row; decode-gated to ≤256 tokens since the 1-row-per-CTA design loses to TE above that | `megatron/core/inference/attention/fused_qk_norm.py` (new: `_fused_qk_rmsnorm_kernel`, `fused_qk_rmsnorm`, `can_use_fused_qk_norm`), `megatron/core/inference/attention/__init__.py` (new), `megatron/core/transformer/attention.py` (guarded fused path in `get_query_key_value_tensors`), env `MCORE_FUSED_QK_NORM`, `MCORE_FUSED_QK_NORM_MAX_TOKENS` (default 256); `dev/moe_fused/harness_qknorm.py` (new) | **27,143.5 / 27,160.3 tok/s** (two runs, mean 27,151.9) | **+2.9%** vs back-to-back gate-OFF 26,363.0 (+2.83% vs CLEANBASE-S9 26,404.4); arms **fully separated** (min ON 27,102.9 > max OFF 26,425.7) | **bf16-ulp, not bit-exact** (max_rel ≤7.6e-3 ≈ one bf16 ulp; TE's internal rsqrt/reduction differs). Microbench MATCH at 128/256/384/512 × 2 seeds. Coherence: **2 of 3** temperature-0 prompts byte-identical to gate-OFF; the France prompt diverges at a low-confidence branch (" Paris, and…" vs " Paris. The…"), both fluent and factually correct | session `qwen-nodecut`, runs `e2e/qknorm-on-1785180416`, `e2e/qknorm-on-2-1785181060`, OFF `e2e/qknorm-off-bb-1785181867` | **Accepted, largest win since QWEN-021.** Microbench CUDA-graph replay at 256 tokens (BS256 decode): 10.25 → 8.20 µs (1.25×), but 0.83×/0.86× at 384/512 → gated decode-only. e2e delivered **+2.9%**, ~3× the ~1% microbench ceiling, because the two norms sit in the serial attention dependency chain and removing a launch + graph node per layer (×48) also cuts host dispatch gaps. TPOT 9.711 → 9.428 ms/tok. Default OFF; `MCORE_FUSED_QK_NORM=1`. Not bit-exact, so acceptance rests on coherence staying fluent+correct, not byte-identity. New best = **79.87%** of vLLM 33,994.5 |
+| CLEANBASE-S9 | 2026-07-27 | Fresh same-session OSL1024 reference at the ten-gate best config, in session `qwen-nodecut`, before the fused QK-RMSNorm lever; re-measured back-to-back with the QWEN-026 ON arm to rule out session drift | none (all ten gates on) | **26,404.4 tok/s** (initial); **26,363.0 tok/s** back-to-back (`qknorm-off-bb`) | baseline (session 9) | Coherent, 5/5 iters | session `qwen-nodecut`, run `e2e/qknorm-off-bb-1785181867` | Clean reference; **77.67%** of vLLM 33,994.5. TPOT 9.695 / 9.711 ms/tok. The two OFF measurements agree to 0.16%, so the +2.9% QWEN-026 delta is not drift |
 | QWEN-024 | 2026-07-26 | HOSTGAP-S6 lever 2. Measure the three parts of the post-sampling chain separately, name the unlabelled window, and attack only the part that is not per-request Python object churn: `update_requests` and `active_request_mask` are already vectorized, and roughly half their whole-tensor op cost is provably dead work at one generated token per request | `dynamic_context.py` (`_write_decode_token_bookkeeping_fast`, `_write_token_bookkeeping_reference`, `_verify_decode_token_bookkeeping`, env `MCORE_INFER_VEC_UPDATE_REQS`, `..._VERIFY`), `text_generation_controller.py` (no-finisher short-circuit), `dev/moe_fused/harness_updreq.py` (new) | **26,128.2 / 26,270.3 tok/s** (two pairs) | **+0.90% vs CLEANBASE-S8** (pairwise +0.71% and +1.10%) | 400-step two-context equivalence with 30 mid-batch terminations + block-boundary crossing; 300 steps under VERIFY; coherence byte-identical | session `qwen-updreq` job 5616264, runs `e2e/vecupd-on-1785100576`, `e2e/vecupd-on-rep2-1785101960` | **Accepted.** Named the unlabelled engine window: it is `post_process_requests` via `async_bookkeep`, invisible to HOSTGAP-S6 only because the engine's NVTX helper is inert unless `_nvtx_enabled` is set. It is **187.9 µs/step of pure per-request Python object churn** (1,719 `len()`, 256 dict lookups, 256 appends, 3 tensor ops per step) and was **deliberately left alone** per the falsification rule. The other half was op-eliminated: host chain 372.4 → 293.7 µs/step, `update_requests` 137.6 → 74.0 µs (1.86×). TPOT −88 µs/step. Default OFF; `MCORE_INFER_VEC_UPDATE_REQS=1`. New best = **77.28%** of vLLM 33,994.5 |
 | CLEANBASE-S8 | 2026-07-26 | Fresh same-session OSL1024 reference at the eight-gate best config, in session `qwen-updreq`, before the `update_requests` host lever | none (all eight gates on) | **25,944.9 tok/s** | baseline (session 8); −0.57% vs QWEN-023's 26,092.5 (session drift) | Coherent, 5/5 iters | session `qwen-updreq` job 5616264, run `e2e/ref-s8-1785099726` | Clean reference; **76.32%** of vLLM 33,994.5. Per-iter 25,669.0 / 25,983.1 / 26,011.2 / 26,023.4 / 26,041.7 — iteration 1 is a 1.3% cold outlier, iterations 2–5 span 0.23%. avg_latency 9,820.6 ms, TPOT 9.867 ms/tok |
 | PROFILE-HOST-S6 | 2026-07-25 | Capture a host-visible trace (`osrt` + CPU sampling + Python sampling) so the ~1237 µs/step of host gaps PROFILE-S6 found between CUDA-graph replays can be attributed to concrete host call sites | none (`dev/moe_fused/profile_host_insession.sh`, new; `dev/moe_fused/dispatch_host_profile.sh`, new) | n/a (BS256/OSL128 profile run) | n/a | n/a | session `qwen-comm` job 5601961 **preempted mid-task**; replacement session `qwen-host` job 5607600 on `nvl72166-T15`, exec `d920241ea00a41618c63a75fefcb9ea2` | **Capture dispatched and running, not confirmed complete within the time box.** Job 5601961 was PREEMPTED (not expired) before any capture could run, so the whole capture had to be re-queued on a fresh allocation that only scheduled at the deadline. Artifact target `sessions/qwen-host/prof/hosts6-1785048883/mcore_host_profile.{nsys-rep,sqlite}`. **No gap attribution was performed.** Next session must first check whether the detached exec produced the artifact |
+| REBASE-S11 | 2026-07-29 | Rebase the twelve-gate branch onto current `main` (141 commits ahead of the old base) and re-measure, since the PR was unreviewable on a stale base | rebase of 14 commits onto `upstream/main` `3ff70c006`; conflict resolutions in `dynamic_context.py`, `text_generation_controller.py`, `router.py`; `dev/moe_fused/run_rebased.sh` (new) | **27,277.4 tok/s** (tpot 9.385 ms, avg_latency 9,340.6 ms, p99 9,589.9 ms) | **−0.91% vs pre-rebase 27,528.6**; 80.24% of vLLM 33,994.5 (was 80.98%) | coherence passed (2+2→4, capital of France→Paris, 3+2 cows→5); all 12 gates present, 3 kernel files present, py_compile clean | job 5694153 on `nvl72159-T08` (5 timed iters, spread 27,214–27,314 tok/s = 0.36%) | **Rebase completed and statically verified; measurement blocked by a node-level Lustre fault, not by code.** Only 1 of 14 commits conflicted (`b9165d87b`), in 3 files, 1 hunk each. (1) `router.py`: upstream added a `qb_beta` selection path (0→26 occurrences); resolved by keeping it and gating the fused topk on `self.qb_beta is None`, since the fused kernel selects on raw logits and cannot honor a qb_beta-shifted selection. (2) `text_generation_controller.py`: purely additive (upstream dummy-forward helpers vs our cached-empty-tensor helpers); kept both. (3) `dynamic_context.py`: upstream made the bookkeeping H2D **conditional on a new `transfer_bookkeeping_to_gpu` param** and returns an `Optional[Event]`; resolved by adopting that contract while keeping the `_INCR_ATTN_STATE` store and profiling epilogue reachable before the return, making the QWEN-023 fast path **decline** whenever `transfer_bookkeeping_to_gpu=False` or `record_bookkeeping_done_event=True` (it publishes itself and records no event), and clearing upstream's new `_bookkeeping_no_real_work` inside the fast path so a stale `True` from an earlier capture step cannot publish `real_token_count=0`. **Note the PR's claimed blocker was wrong**: `vllm_fused_moe.py` is byte-identical between the old merge-base and current `main`, so the SwiGLU region needed no port and applied clean. **Infra blocker:** every run attempt died in `import megatron.core` on a different "missing" module (`sympy._trigonometric_special`, `networkx.preflowpush`, `jaraco.functools`, `nvidia_cutlass_dsl.static_persistent_tile_scheduler`, our own `transformer_layer`). All are the same fault: on `nvl72169-T17` those files **appear in directory listings but `os.path.isfile()` returns False**, while the login node reads all of them fine — a broken Lustre client that serves MDS metadata but cannot stat/open inodes. Do not chase these as package corruption or venv rot — job 5694153 on a healthy node imported everything cleanly with the **unmodified** venv and no overlay, which proves it. **Re-measured via `dev/moe_fused/rebased12.sbatch`** (submitted with plain `sbatch` because cog's repo sync hung three times from this client; runs the unmodified `run_e2e_cfg.sh` for comparability, excludes the bad node, and gates on an `os.path.isfile` health check that aborts in seconds rather than after the model load — that gate is the reusable lesson here). **Verdict: the rebase preserves the gains.** The −0.91% is small enough to be node-to-node variation (the pre-rebase number came from a different node), so 141 upstream commits cost at most ~1%. Log: `agents-space/auto_rebased/rebased12-5694153.out` |
+| CLEANBASE-S12 | 2026-07-30 | Fresh same-node twelve-gate reference before testing upstream's new async scheduling, with no instrumentation loaded | none (all twelve gates on, `ASYNC_SCHED=legacy`) | **26,538.2 tok/s** (tpot 9.646 ms, avg_latency 9,597.3 ms, p99 9,892.8 ms) | baseline (session 12); **−2.71% vs REBASE-S11's 27,277.4 on a different node** | Coherent, 3/3 prompts | session `qwen-gap1` job 5699934 on `nvl72067-T13`, run `e2e/legacy-clean-1785379...` | Clean reference; 78.06% of vLLM 33,994.5. Per-iter 26,373.8 / 26,533.5 / 26,536.8 / 26,535.3 / 26,713.9 — spread 1.29%. **The −2.71% against REBASE-S11 is node-to-node, not a regression**, and is the reason every arm in this session is compared only against same-node runs: node variance here is larger than several accepted gates' individual effects |
+| QWEN-029 | 2026-07-30 | HOSTGAP-S6 attributed the largest remaining lever to G1+G2B — 839 µs/step of resolve-before-prepare bookkeeping that is CPU-bound Python on the serial critical path — and concluded it had to be made cheaper rather than hidden, because `async-sched-mode=serial` (QWEN-005a/b, QWEN-007) refused EP and MoE outright, hung on a single request, and then delivered only +0.85%. **The 141 commits REBASE-S11 landed on replaced that implementation.** `serial` is gone; the mode is now `async` ("prepare-before-resolve"), the EP and MoE guards are gone (only MTP-depth and routing-replay remain), and it has a dedicated copy stream, CPU-ready events, and per-step overlap eligibility. Re-test it as a new feature, not a re-litigation | none — one flag: `--inference-dynamic-batching-async-sched-mode async` (`ASYNC_SCHED=async` in `run_e2e_cfg.sh`) | **27,515.0 tok/s** (tpot 9.304 ms, avg_latency 9,243.0 ms, p99 9,553.6 ms) | **+3.68% vs same-node CLEANBASE-S12 26,538.2**; arms **fully separated** (min ON 27,346.2 > max OFF 26,713.9) | Coherence **byte-identical to the legacy arm on all 3** temperature-0 prompts; no warnings, fallbacks or guard messages in the server log | session `qwen-gap1` job 5699934 on `nvl72067-T13`, run `e2e/async-on-1785379854` | **Accepted — largest single win of the campaign, and it is a flag, not a kernel.** Per-iter 27,346.2 / 27,369.3 / 27,451.1 / 27,569.2 / 27,845.4. **The ledger's "do not re-litigate async scheduling" guidance was correct about the old code and wrong about the new** — worth remembering as a general rule: a rebase that lands 141 upstream commits can invalidate a rejection, so re-check rejected levers whose blocking reason was an explicit upstream guard. **Caveat that makes this an underestimate:** REBASE-S11's conflict resolution makes the QWEN-023 incremental-attention fast path decline whenever the caller defers the bookkeeping publish, which is exactly what async does — so `MCORE_INFER_INCR_ATTN_STATE` is inert in this arm and the +3.68% is *net of losing that gate*. Making the fast path publish-deferral-aware is the obvious follow-up. New best = **80.94%** of vLLM 33,994.5 measured on this node; applying the same-node +3.68% to REBASE-S11 implies ~28,281 tok/s = **~83.2%** |
+| QWEN-028 | 2026-07-30 | The other 48 block boundaries QWEN-027 could not reach. QWEN-027 fused `self_attn_bda` + the standalone `pre_mlp_layernorm`; the matching `mlp_bda` + next-layer *input* norm was ruled unreachable because that norm lives inside the TE `LayerNormLinear` QKV GEMM. That ruling was wrong for this config: at **TP=1** `InferenceLayerNormColumnParallelLinear.forward` runs the norm as its own `_te_rms_norm_kernel` launch immediately before the GEMM, so the preceding layer can compute it. The fused kernel already returns `(normed, new_residual)` — hand the normed half to the next layer's `linear_qkv` and skip its norm launch | `megatron/core/inference/fused_add_rmsnorm.py` (`can_use_fused_add_rmsnorm_qkv`, shared `_tensors_compatible`, env `MCORE_FUSED_ADD_NORM_QKV`), `megatron/core/tensor_parallel/inference_layers.py` (`prenormed_input` hand-off consumed in the `tp_size == 1` path), `megatron/core/transformer/transformer_layer.py` (guarded fused path at the `mlp_bda` site; `_next_layer_qkv` holder), `megatron/core/transformer/transformer_block.py` (`_wire_fused_add_norm_qkv_chain`) | **27,179.2 tok/s** (tpot 9.419 ms, avg_latency 9,361.3 ms, p99 9,661.1 ms) | **+2.42% vs same-node CLEANBASE-S12 26,538.2**; arms **fully separated** (min ON 27,027.8 > max OFF 26,713.9) | **residual bit-exact, norm bf16-ulp** (same kernel as QWEN-027). Coherence: **2 of 3** prompts byte-identical to the legacy arm; the France prompt diverges at a low-confidence branch (" So, what is the capital of Italy?" vs " So, the capital of Italy is Rome."), both fluent and factually correct — the same signature QWEN-026 showed | session `qwen-gap1` job 5699934 on `nvl72067-T13`, run `e2e/qwen028-on-1785380...` | **Accepted, and it over-delivered: +2.42% against a ~1.3% expectation** (47 boundaries × (add 1.5 + norm 2.9 − fused 4.1 µs) ≈ 14 µs/step of device time plus 47 × ~0.78 µs of node cost ≈ 50 µs of a 9,646 µs step ≈ 0.5%). Same pattern as QWEN-026/027: kernels on the serial dependency chain convert at ~3× their device-time arithmetic, because removing a launch also removes a graph node and a host dispatch gap. **The reusable lesson is about the earlier ruling, not the kernel:** "the norm is fused inside `LayerNormLinear`" was true of the *class name* and false of the *TP=1 code path*, and one look at the actual forward would have caught it two sessions earlier. 47 of 48 boundaries fuse — the last layer feeds `final_layernorm` and is left alone. Wiring stores the next layer's `linear_qkv` in a **plain list**, since assigning a Module to an attribute would register it as a second child and duplicate those parameters in `state_dict`. Heavily gated: TP=1, decode token count, RMSNorm, no bias, no offload, and `not layernorm_zero_centered_gamma` (the TE call it replaces hardcodes `zero_centered_gamma=False`). Default OFF; `MCORE_FUSED_ADD_NORM_QKV=1` |
+| QWEN-030 | 2026-07-30 | Do QWEN-029 (async) and QWEN-028 (fused add+QKV-norm) compose, or do they cannibalize each other? They could overlap: async hides host bookkeeping behind GPU work, and part of QWEN-028's win is fewer host dispatches, which async would already be hiding | Both gates on together: `ASYNC_SCHED=async` + `MCORE_FUSED_ADD_NORM_QKV=1` + the 12 prior gates. No new code | **27,889.0 tok/s** (tpot 9.179 ms, iters 27,723 / 27,467 / 27,668 / 28,227 / 28,382) | **+5.09% vs same-node CLEANBASE-S12 26,538.2**; beats async alone (27,459 mean, +3.47%) by +1.56% and QWEN-028 alone (27,179, +2.42%) by +2.61% | same 2-of-3 byte-identical / France-branch divergence as QWEN-028 — async contributes no additional divergence (QWEN-029 alone was byte-identical) | session `qwen-gap1` job 5699934 on `nvl72067-T13`, run `e2e/async-qwen028-1785381339` | **Accepted — new best config.** They compose but **sub-additively**: +5.09% against +5.89% if the two were independent, so ~14% of the combined benefit is double-counted. That is the expected signature of two levers that partly attack the same resource (host dispatch), and it is the reason to always measure the *combination* rather than sum accepted deltas — the ledger's individual percentages cannot be added. Note the run shows a clear warm-up ramp (27,723 → 28,382 across 5 iters, +2.4%), steeper than the legacy arms, so the 5-iter mean **understates** the steady state under async |
+
+| QWEN-031 | 2026-07-30 | Async scheduling drives a dedicated copy stream for the bookkeeping H2D transfer, but the harness pins `CUDA_DEVICE_MAX_CONNECTIONS=1`, which collapses all streams onto one hardware work queue and can serialize that copy behind compute — defeating the overlap async exists to create | `CUDA_DEVICE_MAX_CONNECTIONS=8` with `ASYNC_SCHED=async` + the 12 gates. Env only, no code | 27,522.5 tok/s (tpot 9.301 ms) | **+0.23% vs the async mean 27,459** (two samples 27,515.0 / 27,403.5, which themselves differ by 0.41%) — the delta is **smaller than the noise between two runs of the identical config**, so this is a null result, not a small win | n/a (no numerical change) | session `qwen-gap1` job 5699934 on `nvl72067-T13` | **Rejected — no effect.** The serialization hypothesis was reasonable but wrong here: the bookkeeping H2D is small and evidently already fits alongside compute on one queue, so more queues buy nothing. Worth recording because `CUDA_DEVICE_MAX_CONNECTIONS=1` is a load-bearing setting in *training* configs and the instinct to raise it for overlap is strong — for this decode workload it is inert. **Methodological note: the only reason this is callable as a null rather than a +0.23% win is that two same-config samples existed to size the noise floor at ~0.4%.** Single-sample deltas below ~0.5% on this workload are unresolvable |
+
+| QWEN-032 | 2026-07-30 | `initialize_attention_state` is the largest actionable host phase (204 µs/step) and the code says why: the incremental fast path declines any caller that defers the bookkeeping publish, which is exactly what async scheduling does. Teaching the fast path to honor the deferred publish should recover most of that phase | `dynamic_context.py`: `_incremental_attention_state_update` takes the publish flags and returns `Tuple[bool, Optional[Event]]`, mirroring the full path's conditional publish at its tail; `initialize_attention_state` drops the two gate conditions and forwards the event | 28,178.8 tok/s (tpot 9.085 ms) | +1.04% vs QWEN-030 27,889.0 | coherence identical to QWEN-030 on all 3 prompts | session `qwen-gap1` job 5699934 | **The +1.04% is not real, and the diagnostic is why this entry matters.** A decline-reason tally (`MCORE_INFER_INCR_DIAG`) showed the fast path advancing on **0.1% of calls** (3 in 3,000), with **97.5% declining because `_request_layout_version` differed**. So the mechanism this change unlocks essentially never fires, and the throughput delta has no cause behind it — comparing iteration-by-iteration, the two runs' final iterations are 28,382 vs 28,405, i.e. the means differ only through the warm-up ramp. **Kept because it is a genuine prerequisite** (the gate really did exclude async) and it is what made the diagnostic possible, but it must not be credited with a gain. Lesson: a plausible mechanism plus a delta above the noise floor is still not evidence — instrument the mechanism itself, because here the two agreed and were both wrong |
+| QWEN-033 | 2026-07-30 | The 97.5% decline points at one line: `resolve_requests()` bumps `_request_layout_version` **unconditionally**, invalidating the incremental cache every step. In steady-state decode that bump is provably spurious — with an all-ones active mask no rows move (`survivor_idxs == dst_idxs`), no KV blocks are released, the stale slice is empty and `total_request_count` is unchanged. Every real layout change in that method requires at least one finished request | `dynamic_context.py`: the bump moves from the top of `resolve_requests` into the `finished_idxs.numel() > 0` branch | 27,938.0 tok/s (tpot 9.163 ms) | **+0.18% vs QWEN-030 27,889.0 — no gain.** Best-config samples now read 27,889 / 28,179 / 27,769 / 27,938 (mean 27,944, spread 1.5%), so this sits inside the noise band | **bit-exact, verified under async**: 132 confirmation lines across ranks, up to 90 verified incremental steps each, **zero mismatches** against full recomputation. The specific risk — async's prepare-before-resolve reordering letting the cache key match while the true state differs — did not materialize | session `qwen-gap1` job 5699934 | **Mechanism fixed, no speedup — and that is the finding.** Fast-path engagement went **0.1% → 81%** of calls, so ~204 µs/step of host work really was removed, and throughput did not move. **Therefore that host work was already fully hidden behind GPU execution by async scheduling.** This independently confirms the host-side breakdown's implication and **retires host idle as a lever** — the line of attack that drove several sessions and three deadlocked nsys attempts. Corollary: the 1,598 µs/step of in-step GPU idle measured in the fresh trace should be treated as substantially a profiling artifact (`--cuda-graph-trace=node` plus nsys's own host overhead inflate exactly these host-bound gaps), not as 1.6 ms of recoverable time. **Kept anyway**: it makes a gate that ships in the tuned config actually functional instead of silently inert, at zero measured cost and with bit-exactness proven |
+
+### VLLM-SAMENODE: the first apples-to-apples reference (2026-07-30)
+
+Every "% of vLLM" figure in this ledger before now compared an mcore run on one node against a vLLM run on another, and this session measured node-to-node variance at ~2.7% — large enough to swamp most individual results. So the mcore session was ended and vLLM was run on **the same node** (`nvl72067-T13`, job 5701338), through the identical harness: same client (`static_benchmark.py`), same gsm8k dataset, BS256, OSL1024, 2 warmup + 5 timed iterations.
+
+**vLLM DP4+EP4: 34,415.7 tok/s, tpot 7.438 ms** (iters 34,095 / 35,141 / 34,495 / 33,765 / 34,615).
+
+| | tok/s | ms/step | % of vLLM |
+|---|---|---|---|
+| vLLM DP4+EP4 (same node) | 34,415.7 | 7.438 | 100% |
+| mcore best config (mean of 4 samples) | 27,944 | 9.16 | **81.2%** |
+| mcore best single run | 28,178.8 | 9.085 | 81.9% |
+| mcore at session start (CLEANBASE-S12) | 26,538.2 | 9.646 | 77.1% |
+
+The session moved mcore from **77.1% → 81.2%** of same-node vLLM. Remaining gap: **1.72 ms/step (18.8%)**. Note this is *worse* than the 83.2% previously inferred from cross-node arithmetic — the honest number was slightly flattering before, which is exactly why the same-node reference was worth a run.
+
+### Host-side breakdown under async (the phase timing finally ran)
+
+The `perf_counter` shim (zero-nsys, built after three nsys host-capture deadlocks) produced its first usable report — 4,096 steps under the best config. The two largest entries are **not** actionable: `_forward` (13,996 µs/step) and `sampling` (7,233 µs/step) each exceed the 9,300 µs step, which is only possible because they are blocking waits on GPU work summed across two threads. Reading them as host cost would be the classic profiler mistake.
+
+Actionable pure-host cost, per step: `initialize_attention_state` **204 µs** (largest, and this is *with* `MCORE_INFER_INCR_ATTN_STATE` on), `prepare_requests` 80, `resolve_requests` 62, `_ep_establish_consensus` 58 (538 µs/call but only on ~10.6% of steps), `active_request_mask` 56, `async_sched_transfer_bookkeeping_to_gpu` 50, `drain_zmq_socket` 37. Summed with the smaller ranges, host work totals **~900 µs/step against a 9,300 µs step (~10%)**.
+
+**That total is the useful conclusion, and it redirects the campaign:** host work is far smaller than GPU-busy time, so a scheduler with good overlap should hide essentially all of it. Async captured only ~3.5%, so some overlap is imperfect — but the ceiling on *all* remaining host-side work is under 10%, and most of it is already hidden. **The remaining gap to vLLM is therefore predominantly GPU-side**, which retires "host idle is the top lever" — the ranking that had driven the last several sessions and that three failed nsys attempts were meant to refine.
+
+### Trace staleness: why the ranking had to be re-derived
+
+The gap-ranking used to pick targets came from `mcore-final-jul27` (QWEN-025, 10 gates). QWEN-026/027/028 then removed **precisely the kernels that ranking pointed at**, so it can no longer be used to choose the next target. Re-measuring the old trace made this concrete:
+
+| kernel (in the QWEN-025 trace) | launches | total device time | per call | status now |
+|---|---|---|---|---|
+| `direct_copy_kernel_cuda` (bf16) | 151,680 | 416.6 ms | 2.75 µs | **gone** (QWEN-026) |
+| `triton_poi_fused_add_copy__0` | 151,680 | 200.1 ms | 1.32 µs | **~halved** (QWEN-027/028) |
+| `rmsnorm_fwd_general` (q/k norm) | 2 per layer | — | ~2.3 µs | **gone** (QWEN-026, fused to 1) |
+
+The `direct_copy` finding is the useful one and explains QWEN-026's outsized +2.9%: timeline-neighbour analysis places two of these copies per layer between the QKV GEMM and the two QK norms, i.e. **the strided Q/K split views being materialized contiguous because TE's norm demands contiguous input**. At 2 × ~3 µs × 48 layers that is ~288 µs/step (~3% of an 8.85 ms step) of pure data movement. The fused QK-norm kernel reshapes the split views with no copy (`[-1, head_dim]` is a view when the last dim is contiguous), so it deleted the two copies *and* one norm launch — the copies, not the norm launches, were most of the win. **Generalizable: when a fusion replaces a vendor kernel that has a layout precondition, count the layout-conversion copies as part of the prize; they are often larger than the kernels being fused.** Next target selection requires a fresh trace of the current best config.
 
 ## Session 2 (2026-07-23) — conclusion & recommendation
 
@@ -102,7 +153,9 @@ Every accessible knob was swept and rejected (QWEN-003…009). Key learnings:
   NVLS AllGather-V dispatch** → grouped GEMM (FC1+SwiGLU, FC2) → moe_sum →
   **exposed NVLS ReduceScatter-V combine** — all on the per-layer critical path.
   vLLM/TRT-LLM does the equivalent as one fused MoE (fused routing, cutlass
-  grouped bmm, fused finalize) with **0 exposed comm**.
+  grouped bmm, fused finalize) with ~~0 exposed comm~~ — **the comm half of this claim
+  is false, see VLLM-COMM-S16**: vLLM runs the same AllGather+ReduceScatter pair per
+  layer per step. The fused-routing/finalize half stands.
 - Built-in fusions (`--moe-router-fusion`, `--moe-permute-fusion`) and
   `sampling-backend=flashinfer` are wired to training / non-full-graph paths and
   are **incompatible** with the `inference_optimized` top-8 + full-iteration-graph
@@ -341,8 +394,10 @@ Per PROFILE-DECODE the decode critical path is
 attn → router → **exposed NVLS AllGather-V dispatch** → grouped GEMM →
 **exposed NVLS ReduceScatter-V combine**. In priority order:
 
-1. **Exposed NVLS comm (~16%, and it gates the critical path).** vLLM's
-   equivalent has *zero* exposed comm. Overlap dispatch/combine with the expert
+1. **Exposed NVLS comm (~16%, and it gates the critical path).** ~~vLLM's
+   equivalent has *zero* exposed comm.~~ **False — see VLLM-COMM-S16**: vLLM runs the
+   same AllGather+ReduceScatter at the same per-layer cadence, so this is not pure
+   deficit and was over-prioritized here. Overlap dispatch/combine with the expert
    GEMM via chunked/pipelined experts, or fuse the combine ReduceScatter-V into
    the FC2 epilogue + `_moe_sum`. This is now the single highest-value target.
 2. **The routing chain (~18%).** After QWEN-011 the align is 3 kernels; the
@@ -1535,6 +1590,1627 @@ order: `--cpuctxsw=process-tree`, then `--sample=process-tree` itself, then
 `osrt` tracing. **Do not spend a third session's leftover time on blind retries
 of the full flag set** — bisect the flags against a short capture first, since
 each full attempt costs ~14 minutes.
+
+**QWEN-026 landed: fused QK-RMSNorm, +2.9%, new best 79.87% of vLLM.** This is
+the first attention-side lever to pay off and the largest win since QWEN-021,
+and it over-delivered ~3× against its microbench ceiling — the two per-head
+RMSNorm launches sit directly in the serial attention chain, so collapsing them
+to one kernel removes a launch *and* a graph node per layer (×48) and cuts the
+host dispatch gap between them, not just the ~2 µs/layer of device time the
+microbench saw in isolation. **The lesson for ranking: a small-device-time
+kernel that sits on the serial critical path and removes a graph node is worth
+materially more than its isolated microbench, because graph-node count and
+serial-chain launches both convert.** This makes "collapse two adjacent
+small launches into one" a higher-value pattern than the raw device-time
+numbers suggest — the opposite of QWEN-025's host-side levers, which converted
+at only ~1/3.
+
+The one caveat is that the fused norm is **bf16-ulp, not bit-exact** (TE's
+internal rsqrt/reduction differs), so one of the three coherence prompts flips a
+single near-tie greedy token. Both continuations are fluent and factually
+correct, so it was accepted, but a bit-exact variant (matching TE's rsqrt
+instruction so the two-call path is reproduced exactly) would remove the last
+correctness caveat and is a cheap follow-up if byte-identity is ever required.
+
+**Ranked next levers, after QWEN-026.**
+
+1. **Fuse the other adjacent small-launch pairs on the serial path** — QWEN-026
+   proved the pattern converts at ~3× microbench. The remaining per-layer
+   small-kernel pairs that sit back-to-back in the decode graph are the
+   input-layernorm/pre-MLP-layernorm `rmsnorm_fwd_tuned` pair and the
+   `triton_poi_fused_add_copy` residual-add kernels flanking each block. Target
+   the pair with the shortest serial gap between them first. **Risk medium**;
+   the same decode-only gating and coherence bar apply. Falsified if collapsing
+   the pair does not move the profiled step period the way QWEN-026 did.
+2. **Reduce graph node count** (HOSTGAP-S6 lever 4) — still live at ~0.78 µs per
+   removed node; QWEN-026 removed 48 nodes as a side effect and that clearly
+   helped, so a direct campaign to prune redundant nodes is now better-evidenced
+   than before. **Risk medium**, sharply diminishing.
+3. **Re-attribute the residual G1** — unchanged from the QWEN-025 ranking; still
+   blocked on the nsys host-capture failure. Bisect the host flag set against a
+   short capture, starting with `--cpuctxsw=process-tree`.
+4. **Move per-step request bookkeeping onto the GPU** (HOSTGAP-S6 lever 5) —
+   **Risk high**, multi-session; unchanged.
+
+The most productive next step is to re-profile at the new eleven-gate config
+(all ten gates + QWEN-026) so the next adjacent-launch pair is chosen from the
+current serial gaps rather than the pre-QWEN-026 trace.
+
+**QWEN-027 landed: fused add+RMSNorm (self_attn_bda + pre_mlp_layernorm),
++1.37%, new best 80.98% of vLLM.** PROFILE-S9 chose the target exactly as
+predicted — the residual-add and the next norm were the two dominant small
+kernels and adjacent on the serial path — and the fusion converted cleanly. Two
+things worth carrying forward. First, the **input RMSNorm is not a separate
+module**: for the non-MLA path `linear_qkv = column_parallel_layer_norm_linear`,
+so that norm lives inside the TE `LayerNormLinear` QKV GEMM and cannot be
+intercepted at the layer level. Only the standalone `pre_mlp_layernorm` was
+fusible, so QWEN-027 removed 48 of the 96 candidate boundaries; the other 48
+(the `mlp_bda` + next-layer input norm) would require either fusing across the
+layer boundary or reaching inside TE's `LayerNormLinear`. Second, the add+norm
+kernel does **not** regress at high token counts (flat ~4.1 µs vs QWEN-026's
+1-row-per-CTA design that lost above 256 tokens), so the same pattern is safe to
+apply more widely if the prefill path is ever targeted.
+
+**Ranked next levers, after QWEN-027.**
+
+1. **Re-profile at the twelve-gate config and re-rank.** Two norm+add fusions
+   have now landed; the serial chain has shifted again. Cheapest high-value
+   step before picking the next lever. Specifically check whether
+   `_fused_qk_rmsnorm` (QWEN-026) and the RoPE/append-kv kernels around it are
+   now the tallest adjacent small-kernel run, since attention is the remaining
+   untouched small-kernel cluster.
+2. **Fuse the `mlp_bda` + next-layer input norm boundary** — the other 48
+   boundaries QWEN-027 could not reach, because the input norm is inside
+   `LayerNormLinear`. Options: (a) fuse the `mlp_bda` add into the *start* of the
+   TE QKV GEMM's norm (needs a TE hook or a mcore-side prenorm that bypasses
+   `LayerNormLinear`'s internal norm), or (b) accept a small numeric change by
+   moving the input norm out of `LayerNormLinear` into a standalone fused
+   add+norm like QWEN-027. **Risk medium–high**; (b) changes the QKV GEMM path.
+3. **Reduce graph node count** (HOSTGAP-S6 lever 4) — QWEN-026+027 removed ~96
+   nodes/step as a side effect and both converted at ~3×; a direct node-pruning
+   pass is now well-evidenced. **Risk medium**, diminishing.
+4. **Re-attribute the residual G1** — unchanged; blocked on the nsys
+   host-capture failure. Bisect the host flag set against a short capture.
+
+A bit-exact variant of both fused norms (matching TE's rsqrt instruction) would
+remove the last coherence caveat and is a cheap follow-up if byte-identity is
+ever required — QWEN-027's residual is already bit-exact, only the norm output
+is one bf16 ulp off.
+
+## Session 13 (2026-07-30) — measurement session: why the block is latency-bound
+
+No optimization was accepted this session. It replaced the campaign's measurement
+basis, which had been quietly wrong, and produced the first quantified path to
+parity. Everything below is same-node (`nvl72151-T13`) unless stated.
+
+### CLEANBASE-S13 — same-node reference, and the tightest drift control yet
+
+| Arm | Throughput | tpot |
+|-----|-----------|------|
+| `ep01_ref` (13 gates + async) | **28,529.1 tok/s** | 8.973 ms |
+| `ep06_ref2` (repeat, end of allocation) | **28,606.9 tok/s** | 8.949 ms |
+
+0.27% apart, so on this node anything above ~0.3% is a real effect. Note this node
+is ~2.1% faster than `nvl72067-T13`, where the best config measured 27,944 and the
+vLLM reference 34,415.7 — **the 81.2% figure remains the only same-node
+comparison; 28,529 must not be divided by 34,415.7.**
+
+### NSYS-UNUSABLE — nsys cannot measure this workload, in any mode
+
+The hypothesis was that `--cuda-graph-trace=node` was inflating the trace by timing
+~1,800 kernel nodes per step, and that `=graph` would collapse each replay to one
+range and restore fidelity. It failed on every count:
+
+| Arm | Throughput | vs unprofiled |
+|-----|-----------|---------------|
+| unprofiled | 28,469.5 | — |
+| `--cuda-graph-trace=graph` | 20,557.2 | **−27.8%** |
+| `--cuda-graph-trace=node` | 20,174.0 | **−29.1%** |
+
+1. The mode is worth only 1.3 points. **nsys costs ~28% here regardless**, and the
+   overhead is host-side.
+2. On nsys 2026.3.1 `=graph` does **not** collapse replays: all 224k kernel rows
+   still appear, with `graphId` NULL. The 98 rows in
+   `CUPTI_ACTIVITY_KIND_GRAPH_TRACE` are graph *instantiations* from warmup.
+3. Step reconstruction from the trace again produced an impossible 71.8 ms "step"
+   against a known 12.45 ms — the same divisor trap as earlier sessions.
+4. Worst: the host-side overhead desynchronizes the EP ranks, and the NVLS
+   collectives are spin-waits, so they inflate **~120×**
+   (`_multimem_all_gatherv_3tensor` reads 849 µs/call; 48 of those would be 40 ms
+   against a 9 ms step). An earlier trace measured the same kernel at ~7 µs.
+
+**Consequence: every absolute idle, gap, and barrier-wait number this campaign read
+off an nsys trace is unsafe**, including HOSTGAP-S6's inter-replay gaps and the
+"1.6 ms/step idle" and "4.4× barrier spread" that motivated sessions 7–12. Relative
+per-call durations of *compute* kernels remain usable. Do not profile this workload
+with nsys to obtain a busy/idle split; use STEPGPU below.
+
+### STEPGPU-S13 — the block graph is 92.8% of the step (`step_gpu_timing.py`)
+
+New env-gated instrumentation (`MCORE_INFER_STEP_GPU_TIMING`) wraps
+`TransformerBlock.__call__` on the CUDA-graph path with CUDA events, held in a ring
+of 64 pairs and read back only when the ring wraps, so no step synchronizes on its
+own work. It costs 2.3% and, unlike nsys, **validates itself**: the step period it
+reports (8.97 ms) matches the benchmark's tpot (8.973 ms).
+
+| Quantity | Value | Share |
+|----------|-------|-------|
+| step period | 8.97 ms | 100% |
+| transformer-block CUDA graph | ~8.33 ms | **92.8%** |
+| everything outside the graph | **0.59 ms** | 6.6% |
+
+Held within 0.2 points across all 4 ranks over 4,032 steps, and reproduced at 92.8%
+in a second sample. **This retires host-side optimization quantitatively.**
+Embedding, logits GEMM, sampling, bookkeeping and every host gap together are
+0.59 ms; the gap to vLLM is ~1.53 ms/step. Third confirmation after QWEN-032/033,
+and the first that is a measurement rather than an inference.
+
+### EPSKEW-S13 — the EP skew hypothesis is falsified
+
+All 4 ranks are processes on one node, so `perf_counter_ns` is directly comparable
+between them; the spread of step-entry timestamps *is* the arrival skew the NVLS
+spin-waits absorb. Median spread **24 µs**, p90 46 µs — 0.27% of the step. Rank 1 is
+mildly structurally late (last on 42% of steps, first on 7%) but by only ~21 µs
+median. The "4.4× barrier wait spread" was an nsys artifact per NSYS-UNUSABLE.
+**Host arrival skew is not a lever.** Do not revisit without new evidence.
+
+### BSSCALE-S13 — 32× the tokens costs 1.70× the block time
+
+Batch-size sweep with the block timer on. Valid points are exact CUDA-graph buckets;
+BS192 is padded into the 256 bucket, so the curve is a staircase, not smooth.
+
+| BS | step | block | µs/layer |
+|----|------|-------|----------|
+| 8 | 5.563 | 5.030 | 105 |
+| 16 | 5.896 | 5.361 | 112 |
+| 32 | 6.290 | 5.770 | 120 |
+| 64 | 7.081 | 6.542 | 136 |
+| 128 | 7.140 | 6.585 | 137 |
+| 256 | 9.151 | 8.553 | 178 |
+
+**The block is latency-bound, not compute-bound.** The batch-independent floor is
+~5.03 ms/step = **105 µs/layer = 55% of the whole step**; the marginal cost of the
+other 248 tokens is only 73 µs/layer. For scale, vLLM's *entire* step is 7.44 ms
+while mcore's floor plus non-graph overhead is already ~5.6 ms.
+
+### CHAINCOST-S13 — fusion pays, but *not* per kernel removed
+
+All 13 gates off vs on, at two batch sizes:
+
+| | block ON | block OFF | delta |
+|---|---------|-----------|-------|
+| BS8 | 5.030 | 6.295 | 1.265 ms/step = 26.4 µs/layer |
+| BS256 | 8.553 | 10.317 | 1.764 ms/step = 36.7 µs/layer |
+
+At BS8 the block is nearly pure latency, so 26.4 µs/layer over the ~10 kernels the
+gates remove suggests ~2.6 µs of serial chain latency per kernel — well above those
+kernels' own 1–2 µs device time. The 13 gates are jointly worth **16.1%** of
+throughput.
+
+**The per-kernel decomposition did not survive calibration — it is refuted.**
+Six single-gate arms at BS8, against the all-gates-ON block of 5.030 ms:
+
+| arm | block | delta | µs/layer | kernels/layer | µs/kernel |
+|-----|-------|-------|----------|---------------|-----------|
+| `MCORE_FUSED_QK_NORM=0` | 5.291 | +0.260 | 5.4 | 1 | 5.4 |
+| `MCORE_ROUTER_FUSED_TOPK=0` | 5.292 | +0.261 | 5.4 | 3 | 1.8 |
+| `MCORE_FUSED_ADD_NORM=0` | 5.698 | +0.668 | 13.9 | 2 | 7.0 |
+| `MCORE_FUSED_ADD_NORM_QKV=0` | 5.375 | +0.345 | 7.2 | 1 | 7.2 |
+| `MCORE_MOE_GEMM_TUNE=0` | 4.762 | **−0.268** | −5.6 | count-neutral | — |
+| `MCORE_MOE_SUM_FAST=0` | 5.073 | +0.043 | 0.9 | count-neutral | — |
+
+Least squares over the four chain-reducing arms gives **slope 0.30 µs/layer per
+kernel removed with a 7.46 µs/layer intercept** — i.e. kernel count explains almost
+nothing and the per-gate constant dominates. Per-kernel cost ranges 1.8–7.2 µs with
+no consistency. **There is no usable per-kernel coefficient, and any projection of
+the form "remove N kernels, gain N × c" is invalid.** The earlier ~2.6 µs/kernel
+figure and the "25 → 15 kernels buys 1.25 ms and most of the path to parity"
+projection are both withdrawn.
+
+Two further cautions from the same data:
+
+- **Single-gate deltas are strongly sub-additive and must not be summed.** Just four
+  gates sum to 31.9 µs/layer, already *more* than all thirteen together (26.4), so
+  these arms are contending for a shared resource — the same signature QWEN-030 saw.
+- The measurement itself is sound: six arms produced six clearly distinct outcomes
+  (−5.6 to +13.9 µs/layer), so there is no "any gate off costs the same" artifact,
+  and the earlier suspicion of BS8 graph-node quantization was unfounded. The
+  identical QK-norm / router-topk pair was coincidence.
+
+**GEMM-TUNE-SMALLBATCH (new, actionable):** `MCORE_MOE_GEMM_TUNE=1` is a **~5%
+regression at BS8** — turning it off raised throughput 1438.0 → 1509.6 tok/s. The
+QWEN-013 tiles were tuned for 256-token decode and QWEN-013b added an *upper* bound
+(fall back above M=384) but never a lower one, so at 8 tokens the tuned tiles are
+simply the wrong shape. A lower-bound guard is a small, low-risk fix. Irrelevant to
+the BS256 parity goal; relevant to anyone serving small batches.
+
+**This finally explains the campaign's recurring puzzle.** QWEN-026, 027 and 028
+each over-delivered ~3× their device-time arithmetic and each was recorded as a
+surprise. Removing a launch removes a *chain link*, not just a duration — in a
+latency-bound block that is the expected multiplier, not luck.
+
+**The 105 µs/layer floor remains unattributed.** A split into ~66 µs of serial chain
+and ~39 µs of NVLS collectives was arithmetically tempting and consistent with
+QWEN-016's "exposed, latency-bound" finding, but it was built on the per-kernel
+figure the calibration then refuted, so it is withdrawn. Attributing the floor needs
+a direct measurement, not a coefficient — the obvious candidate is an env-gated
+ablation that stubs one component at a time inside the graph and reads the block
+timer, since `step_gpu_timing.py` now makes that a reliable readout.
+
+### NCCL-HANG — `inference_moe_token_dispatcher_type=nccl` is non-functional here
+
+With async scheduling and the 13 gates, the server starts and then every request
+times out. It hung for 2 h and cost half the allocation, which also lost the
+nvls-vs-nccl comparison. Two process lessons: job scripts now carry
+`timeout --signal=INT 1200`, and a watcher that reports only *state changes* cannot
+distinguish a hung job from a healthy one — it needs a log-mtime staleness check.
+
+### Session 13 — conclusion & recommendation
+
+The target is no longer expensive kernels; it is **per-layer latency**. Ranked by
+evidence:
+
+What is certain: the prize is inside the transformer block (92.8% of the step), the
+block is latency-bound rather than throughput-bound (32× tokens for 1.70× time,
+~55% batch-independent), and neither host work nor EP arrival skew is worth another
+hour. What is *not* known is what the 105 µs/layer floor is made of — and this
+session showed that guessing at it from coefficients produces retractions.
+
+1. **Attribute the 105 µs/layer floor by direct ablation.** Env-gated stubs for one
+   component at a time (NVLS dispatch, NVLS combine, expert GEMM, attention) read
+   through the now-trustworthy block timer. Output is garbage under ablation, which
+   is fine — only the timing is wanted. This is the prerequisite for sizing
+   anything else, and it is the cheapest remaining experiment.
+2. **The 2 NVLS collectives** — the leading suspect for the floor, on the strength
+   of BSSCALE (cost is barrier latency, not bytes) and QWEN-016. Levers: fewer
+   barriers (fuse dispatch/combine, or hoist across layers) or overlap with
+   compute. QWEN-017 already failed at replacing the barrier itself; overlap is
+   unexplored. **Size it via item 1 before building.**
+3. **More fusion** — still plausible, and the aggregate (13 gates = 16.1%) says the
+   direction has paid. But the per-gate value is idiosyncratic, not proportional to
+   kernels removed, so each candidate must be sized on its own rather than from a
+   chain-length model.
+4. **Do not** pursue host-side work, EP arrival skew, or nsys-derived idle.
+5. Small, separate: add a lower-bound guard to `MCORE_MOE_GEMM_TUNE`
+   (GEMM-TUNE-SMALLBATCH).
+
+## Session 14 (2026-07-30/31) — the floor, attributed at last
+
+Session 13 ended unable to say what the ~105 µs/layer floor was made of, having
+twice retracted an inference built on per-kernel coefficients. This session
+measured it directly and the answer reorders the whole campaign. Node
+`nvl72115-T08`; all comparisons within it.
+
+### ABLATE-HARNESS — how the floor was measured (`floor_ablation.py`)
+
+New env-gated module plus six call-site gates. Each deletes one component from
+the *captured* block graph and the change is read from `step_gpu_timing`. Three
+design points are what make it trustworthy:
+
+* **Ablate only while capturing** (`torch.cuda.is_current_stream_capturing()`).
+  Warmup runs eagerly first, so every real kernel executes at least once and
+  every preallocated buffer holds plausible values; capture then takes the
+  ablated branch, so the choice is resolved once and no replay gains
+  data-dependent control flow.
+* **Substitute cached zeros, never uninitialized memory.** Zeros keep the
+  residual finite, so the next layer's router still spreads tokens across
+  experts. Garbage would collapse routing and silently change the grouped-GEMM
+  tile balance of the components *not* being ablated. Caching by shape matters
+  too: a fresh `torch.zeros` per replay would add a multi-MB fill to the
+  measurement it is meant to isolate.
+* **`hit()` logs the first time each site takes its ablated branch.** This
+  immediately caught a dead gate (see ATTN-BIG) that would otherwise have read
+  as "attention is free".
+
+Deltas are **chain** deltas: they include the serialization a component imposed
+on its neighbours, which in a latency-bound block is the quantity that matters,
+and they are deliberately not comparable to a profiler's kernel duration.
+
+Drift control: two baselines 0.4% apart on block time (7.639 / 7.607 ms) but
+**2.5% apart on throughput** (27,626 / 28,321 tok/s). Block time is the primary
+metric this session; throughput differences under ~2.5% mean nothing here.
+
+### FLOOR-S14 — the composition, and which parts are addressable
+
+Baseline block **7.623 ms = 158.8 µs/layer** at BS256/OSL1024.
+
+| component removed | block | delta | µs/layer | % block | tput |
+|---|---|---|---|---|---|
+| expert GEMMs (FC1+SwiGLU+FC2) | 4.804 | −2.819 | −58.7 | −37.0% | +48.3% |
+| attention (`flash_decode_and_prefill`) | 5.756 | −1.867 | −38.9 | −24.5% | +27.4% |
+| topk reduce (`_moe_sum`) | 7.079 | −0.544 | −11.3 | −7.1% | +7.9% |
+
+**GEMM-ROOFLINE — the expert GEMM is done, and this is the session's most
+consequential finding.** Per layer per rank it streams 32 local experts' FC1+FC2
+weights = **302 MB**, so 14.5 GB per step. Against QWEN-012's measured 6.08 TB/s
+that is a 49.7 µs/layer floor, and it measures 58.7 — **84% of achievable
+bandwidth**. Only 19.3 GFLOP/layer, so it is nowhere near compute-bound; it is
+weight-streaming-bound. Consequences:
+
+1. The largest single component, 37% of the block, is **essentially optimal in
+   bf16 and cannot be tuned further.** Stop looking at grouped-GEMM tiling for
+   throughput at BS256.
+2. **vLLM pays the same 2.83 ms/step**, because it streams the same weights in
+   the same precision. So the gap to vLLM does *not* live here, and every prior
+   session that ranked "MoE grouped-GEMM 40.5%" as the top target was ranking by
+   size rather than by addressability.
+3. The only lever on it is fewer weight bytes: FP8/NVFP4 experts, which is a
+   precision decision, not a kernel one.
+
+Subtracting it: our addressable non-GEMM cost is ~4.80 ms of block + 0.59 ms
+outside ≈ **5.39 ms/step**, against vLLM's ~4.6 ms on the same arithmetic. **The
+whole remaining gap is ~0.8 ms/step of non-GEMM work**, and attention plus the
+topk reduce are 2.41 ms of that region — enough room to close it without
+touching the GEMM.
+
+**ATTN-BIG — attention is 38.9 µs/layer and roughly 3× off its own roofline.**
+This is the new top target and it was invisible until now. At 64 tokens/rank and
+~600 average context it reads ~79 MB of paged KV per layer per rank, a 13 µs
+bandwidth floor against 38.9 µs measured = **33% of 6.08 TB/s**. Unlike the
+GEMM there is real headroom, and it is 24.5% of the block with a +27.4%
+throughput ceiling.
+
+Process note: the first attention arm reported **zero** delta, and only the
+`hit()` log revealed why — the gate was on `_run_core_attention`, which the
+*static* engine uses. Dynamic batching calls `flash_decode_and_prefill`. Without
+the hit counter this would have been recorded as "attention is free", which is
+exactly the class of false negative that cost sessions 7–12.
+
+**Two arms are invalid; recording them so they are not re-read as results.**
+`MCORE_ABLATE_NVLS_DISPATCH` and `..._COMBINE` both hit the 1500 s timeout
+(rc=124). Prefill runs the real collective eagerly while replays skip it, which
+almost certainly desynchronizes the symmetric-memory barrier sequence between
+ranks. Their block numbers (−0.66 and −3.26 ms) were measured in a degraded
+state and **must not be quoted**; the NVLS collectives remain unmeasured.
+`MCORE_ABLATE_MOE_ALIGN` is invalid for a different reason: replaying warmup's
+align tables also shrank `num_tokens_post_padded`, so the GEMMs did less work and
+the arm measured that instead of the align cost.
+
+### QWEN-034 — FC2 epilogue topk reduce (atomics): rejected, −12.5%
+
+Hypothesis, sized off the ablation rather than guessed: the topk reduce is worth
+11.3 µs/layer of chain, so folding it into FC2's epilogue should recover most of
+it and drop the `[num_valid, K]` intermediate as well. FC2 already loads the
+routing weight (`MUL_ROUTED_WEIGHT`) and row *r* belongs to token `r // topk`, so
+the change is small: scale the fp32 accumulator and `tl.atomic_add` into the
+`[max_tokens, K]` output instead of storing.
+
+| | block | throughput |
+|---|---|---|
+| baseline | 7.623 | ~27,974 |
+| `MCORE_FUSE_FC2_REDUCE=1` | 8.995 | 24,468 |
+
+**+1.372 ms/step (+28.6 µs/layer), −12.5% throughput.** Coherence passes and the
+fused form is strictly *more* accurate (no bf16 truncation of each slot before
+the sum), but it is far slower: the atomics cost ~40 µs/layer against the 11.3 it
+was meant to save, and the destination also needs an 8.4 MB zero-fill per layer.
+Kept default-off as a documented negative.
+
+Why it failed, and the general lesson: a topk slot's contributions land on one
+output row from *different* tiles, so the reduction cannot be kept in registers
+and every element becomes a global read-modify-write. This is the same wall
+QWEN-001's mega-fusion hit. **Epilogue fusion pays when the consumer is
+elementwise on the tile (QWEN-002's SwiGLU, QWEN-013's squared-relu) and loses
+when it reduces *across* tiles.** That rule now has two independent
+confirmations and should be applied before building, not after.
+
+### Session 14 — conclusion & recommendation
+
+The campaign's target list is now ordered by *addressability* rather than size:
+
+1. **Attention, 38.9 µs/layer at 33% of its bandwidth roofline** — the largest
+   component with real headroom, +27.4% ceiling. Start by identifying which
+   FlashAttention generation decode actually resolves to (`flash_attention_version`
+   has no CLI flag; a benchmarking env override and a one-shot log were added) and
+   A/B the alternatives, then look at paged-KV over-read and the decode split-K.
+2. **The topk reduce, 11.3 µs/layer** — real but *not* via epilogue atomics
+   (QWEN-034). A separate kernel that reduces with better locality, or folding it
+   into the combine, are the remaining options.
+3. **The NVLS collectives are still unmeasured** — the ablation needs to skip the
+   collective in warmup too, so the barrier sequence stays consistent across
+   ranks, before any number from it is trusted.
+4. **Do not** pursue grouped-GEMM tuning for BS256 throughput (GEMM-ROOFLINE),
+   host-side work, EP arrival skew, or nsys-derived idle.
+5. Precision (FP8/NVFP4 experts) is the *only* lever on the 37% the GEMM
+   occupies, and it is a correctness decision that needs its own evaluation.
+
+## Session 15 (2026-08-01) — FlashAttention-2 beats FlashAttention-4 on decode
+
+All arms: BS256, OSL1024 unless noted, 4×GB200 node `nvl72151-T14`, job `5765929`,
+session `qwen-attn`, thirteen accepted gates on, `run_rebased.sh`. Block-graph GPU
+time from `step_gpu_timing.py` (CUDA events, no profiler), median over the whole
+decode range.
+
+### QWEN-035 — pin FlashAttention 2 on the decode path: **+3.5%**
+
+| arm | block-graph GPU | throughput |
+| --- | --- | --- |
+| `ga00_ref` FA4 (mcore's auto choice) | 7.695 / 7.707 ms | 28,149.6 |
+| `ga05_ref2` FA4, repeat | 7.751 / 7.698 ms | 28,098.1 |
+| `ga02_fa2` FA2 pinned | 7.412 / 7.400 ms | 28,999.2 |
+| `ga04_fa2b` FA2 pinned, repeat | 7.398 / 7.384 ms | 29,225.9 |
+| `ga11_fa2_five` FA2, 5 timed iters | — | **29,132.8** |
+
+Repeat spread is 0.3% on block time and 0.2–0.8% on throughput, so the 4.1% block
+separation is roughly ten times the noise floor. `ga11_fa2_five` is the headline
+number: 5 timed iterations at 28,705.6 / 29,287.2 / 29,199.4 / 29,230.4 /
+29,249.3 tok/s — 0.30% spread across iterations 2–5, with iteration 1 the usual
+ramp outlier. tpot 8.787 ms/tok, avg_latency 8,733.2 ms. It agrees with both
+3-iteration runs (mean of all three: 29,119). Coherence is identical on two of
+three probes and equally correct on the third — expected, since the two backends
+accumulate in a different order. **85.7% of vLLM's 33,994.5** on the 5-iteration
+headline run, up from 82.7%.
+
+The mechanism is in `flash_decode_and_prefill`, not in the kernels' relative
+quality: mcore's auto-preference is FA4 → FA3 → FA2, but **FA4 has no dedicated
+decode kernel on this path**. FA4 decode is routed into `flash_attn4_varlen_func`
+— the varlen *prefill* interface, called with `max_seqlen_q = 1` — while FA2 goes
+to `flash_attn_with_kvcache`, the purpose-built flash-decoding kernel with
+split-KV and combine. So the auto-resolution order silently costs 3.5% on decode.
+This is arguably an upstream default bug rather than a tuning knob. FA3 is not
+installed in this container (`HAVE_FA3=False`), so `ga01_fa3` asserted out; the
+FA3 leg of the comparison is untested.
+
+Enable with `MCORE_FLASH_ATTN_VERSION=2` (the env override added in Session 14
+because `flash_attention_version` has no CLI flag). Config still wins over env.
+
+The gain is **entirely inside attention**, and the ablation proves it: with
+attention stubbed out, the block floor is the same under both backends (5.858 ms
+FA4 vs 5.884 ms FA2, inside noise), so attention alone goes 1.843 → 1.510 ms/step,
+−18%.
+
+### ATTN-ROOFLINE-S14-RETRACTED — attention is *not* 33% of roofline
+
+Session 14 recommended attention as "the largest component with real headroom,
+33% of its bandwidth roofline, 3× available". **That roofline was wrong** and the
+recommendation it produced should not be reused.
+
+KV-cache reads alone, per layer per rank, are
+`B(256) × S × 2(K,V) × H_kv(4) × D(128) × 2 B`. At OSL1024 with ~100-token gsm8k
+prompts the average KV length across the decode is ~600, giving **315 MB/layer**
+→ **39.3 µs/layer at 8 TB/s HBM**. The measured attention chain delta under FA2 is
+31.5 µs/layer, and a chain delta *understates* a kernel's duration whenever any of
+it overlaps neighbouring work. Attention is therefore at or above its bf16
+bandwidth bound, not a third of the way to it. There is no 3× there, and the only
+lever on it is reading fewer bytes (FP8 KV cache — no knob exists in mcore today).
+
+### FLOOR-CONST-S15 — the non-attention floor is KV-length independent
+
+| arm | OSL | attention | block-graph GPU |
+| --- | --- | --- | --- |
+| `ga06_fa2_na` | 1024 | ablated | 5.880 / 5.888 ms |
+| `ga09_o512_na` | 512 | ablated | 5.833 / 5.871 ms |
+
+Halving the output length halves the average KV length and changes the ablated
+floor by 0.6%, i.e. not at all. **The 5.85 ms floor contains no KV-dependent
+work**, so it is pure weight-streaming, collectives, and chain latency, and it can
+be reasoned about independently of the decode position. Its OSL512 attention-free
+throughput is 34,432 tok/s.
+
+The matching OSL512 *reference* arm (`ga08_o512`) is unusable: rc=124, the server
+stalled after ~200 decode steps and hit the 1500 s timeout, so its single
+4.93 ms report is from a degraded run. The intended KV-length scaling test of
+attention is therefore still untested; only the floor half of the pair survived.
+
+### Rejected: KV-cache block size 512
+
+`ga07_fa2_b512` (`--inference-dynamic-batching-block-size 512`, default 256):
+block 7.413 / 7.390 ms, 29,122.9 tok/s — indistinguishable from FA2 at the default
+block size. Paged-KV indirection granularity is not a cost here.
+
+### NVLS-UNABLATABLE — the collectives cannot be sized by subtraction, ever
+
+The Session 14 recommendation was to fix the NVLS ablation by suppressing the
+collective in warmup too, so the symmetric-memory barrier sequence stays
+consistent across ranks. That fix was made (`nvls_off()`, an unconditional gate
+replacing the capture-only one) and it worked as intended: `ga10_nonvls` ran to
+completion, rc=0, no hang, and both gates fired on all four ranks
+(`nvls_dispatch` 4 hits, `nvls_combine` 4 hits).
+
+**The result is that removing both collectives makes the block 13.5% slower:**
+8.391 / 8.407 ms against the 7.39 ms FA2 baseline, 25,950.2 tok/s against 29,113.
+
+Removing two collectives cannot make their own absence expensive, so the arm is
+confounded, and the reason is structural rather than a gating bug:
+**`multimem_all_gatherv_3tensor` produces the work descriptor for everything
+downstream.** `dispatch_preprocess` reads `routing_map` back out of the gathered
+symmetric buffer (`agv_r["tensor"].view(global_max, topk)`), and that routing map
+is what determines how many token-expert assignments — hence how many grouped-GEMM
+tiles — the experts execute. Skip the gather and the buffer still holds whatever
+warmup's *prefill* gather left there, which has a different and denser assignment
+distribution than steady-state decode. So the experts do a different amount of
+work, and the measured block time says nothing about the collective.
+
+This is the same work-descriptor confound that invalidated the Session 14 MoE-align
+ablation, and it is not fixable by better gating. **Subtractive ablation is the
+wrong instrument for the dispatch collective**, and by extension for anything that
+computes a work descriptor. Four attempts have now failed on this (two hangs, one
+align confound, this one); stop trying.
+
+The right instrument is non-invasive in-situ timing: a second CUDA event pair
+recorded around the collective inside the captured graph, read back through the
+same wrapped ring `step_gpu_timing.py` already uses for the whole block. Graph-
+captured event records replay, so this measures the real duration per replay while
+leaving the work descriptor and the barrier sequence completely untouched. That is
+the next experiment, and it needs no ablation at all.
+
+### Session 15 — conclusion & recommendation
+
+Where the 7.39 ms block actually goes, with roofline where it is known:
+
+| component | measured | bf16 bandwidth floor | verdict |
+| --- | --- | --- | --- |
+| attention | 1.51 ms | ~1.89 ms (315 MB/layer) | **at the bound** |
+| expert GEMMs | ~2.16 ms | 1.81 ms (302 MB/layer) | 84% of bound |
+| dense QKV/O proj | — | 0.23 ms (37.8 MB/layer) | negligible |
+| **unaccounted** | **~3.4 ms** | n/a | **the target** |
+
+Two thirds of what is left is neither attention nor weight streaming. That ~3.4 ms
+— 46% of the block — is NVLS dispatch/combine, routing/permute, norms, and chain
+latency, and it is the only place a 14% end-to-end gap can still come from. The
+early OSL1024 profile already noted mcore carrying 11.5% exposed EP comm against
+vLLM's zero, which points the same way.
+
+1. **Attribute the ~3.4 ms remainder with in-situ event timing, not ablation.**
+   NVLS-UNABLATABLE settles the method question: the dispatch collective produces
+   the routing map that sizes all downstream GEMM work, so subtracting it changes
+   the work and the timing is meaningless. Add a per-site CUDA event pair inside
+   the captured graph (same ring-buffer readback as `step_gpu_timing.py`) around
+   the dispatch, the combine, and the expert GEMM. Nothing else should be built
+   before those three numbers exist.
+2. **Overlap, not replacement, for the NVLS barriers.** QWEN-017 already failed at
+   replacing the barrier itself; overlapping dispatch/combine with expert compute
+   is unexplored and is the natural lever if item 1 sizes them large.
+3. **Precision is the only lever on the bandwidth-bound 3.7 ms** (attention +
+   expert GEMMs together). FP8 KV cache would need implementing — no mcore knob
+   exists — and would roughly halve attention. FP8/NVFP4 experts likewise. Both
+   are correctness decisions needing their own evaluation.
+4. **Raise the FA4 decode path upstream.** Independent of this campaign: FA4
+   resolving to a prefill kernel for decode costs every mcore inference user 3.5%.
+5. **Do not** pursue attention kernel tuning (at its bound), grouped-GEMM tuning,
+   KV block size, host-side work, EP arrival skew, or nsys-derived idle.
+
+## Session 16 (2026-08-02) — the block, attributed
+
+Job `5777945` on `nvl72117-T17`, session `qwen-insitu`, thirteen gates + FA2,
+BS256/OSL1024. New module `megatron/core/inference/insitu_timing.py`.
+
+### INSITU-METHOD — external event records, and the two probes that were needed
+
+Subtraction is dead (NVLS-UNABLATABLE) and nsys is unusable here, so components are
+timed *in place* with an event pair inside the captured graph. Getting there took two
+standalone probes, and both earned their keep by failing:
+
+1. **Plain `torch.cuda.Event.record()` during capture does not work.** It raises
+   nothing and does become a graph node, so it looks fine — and then
+   `elapsed_time` fails with `cudaErrorInvalidValue`, because an ordinary
+   event-record node exists only for intra-graph ordering and carries no
+   host-readable timestamp. The first instrumented run duly reported every site as
+   zero. Had the probe not existed, the natural reading of that run would have been
+   "the sites cost nothing".
+2. **`cudaEventRecordWithFlags(..., cudaEventRecordExternal)` does work**, via
+   ctypes since PyTorch exposes no flags argument. It must target the *capturing*
+   stream; `torch.cuda.graph()` picks its own side stream unless passed one, and
+   getting that wrong returns `cudaErrorIllegalState` (401) rather than anything
+   descriptive.
+
+Two properties make the output trustworthy. Summed sites reconstruct the whole graph
+to **1.3%** in the probe, so the decomposition is additive. And the instrumentation
+costs **2.0%** of block time (7.543 ms instrumented vs 7.396 ms control, same
+config, same node), which is small and, more importantly, measured rather than
+assumed. Each event pair carries ~2.2 µs of its own overhead, read directly from a
+`_calib` site wrapping an empty region in the same graph and subtracted from every
+other site — without that, a 8 µs component reads ~30% high.
+
+### FLOOR-ATTRIB-S16 — where the 7.4 ms block goes
+
+Rank 0, per-layer medians net of pair overhead, scaled ×48. Two sampled layers (8
+and 24) with their spread, so an atypical layer is visible rather than silent.
+
+| component | µs/layer | ms/step | % of block | layer spread |
+| --- | --- | --- | --- | --- |
+| `expert_gemm_fc1` | 37.6 | 1.806 | 24.0% | 6% |
+| `expert_gemm_fc2` | 26.5 | 1.272 | 16.9% | 18% |
+| `attn_core` | 25.2 | 1.208 | 16.0% | 3% |
+| `nvls_combine` | 14.1 | 0.677 | 9.0% | 81% |
+| `nvls_dispatch` | 13.9 | 0.665 | 8.8% | 5% |
+| `moe_sum` | 7.9 | 0.380 | 5.0% | 9% |
+| `moe_align` | 7.8 | 0.373 | 5.0% | 3% |
+| **sum of sites** | | **6.381** | **84.6%** | |
+| unattributed (norms, router, QKV/O proj, RoPE) | | 1.180 | 15.6% | |
+
+**The NVLS collectives are finally sized: 1.34 ms/step, 17.8% of the block.** After
+two hangs and two work-descriptor confounds, this is the first real number for them,
+and it lands at the low end of the 1.5–2 ms the barrier-count argument predicted.
+`nvls_combine`'s 81% layer spread (18.2 µs at layer 8 versus 10.0 at layer 24) and
+its cross-rank variation are the expected signature of a spin-wait absorbing
+arrival skew, not measurement noise.
+
+**Expert GEMMs are 3.08 ms, 40.8% — larger than the ~2.16 ms previously estimated**,
+and the split is the interesting part. FC2 costs 70% of FC1 while reading half the
+weight bytes (101 vs 201 MB/layer/rank) and doing half the FLOPs. Either FC2's
+tiling is leaving bandwidth on the table or it is not weight-bound at all.
+
+**Attention is 25.2 µs/layer, not the 31.5 the chain delta implied.** Chain deltas
+overstate, as suspected — one more reason not to quote them as component costs.
+
+### HBM-BW-S16 — the roofline denominator was wrong
+
+Measured achievable HBM bandwidth on this GB200 (184 GiB, 152 SMs): **6.85 TB/s**
+sustained on a large bf16 copy, at both 2 GiB and 8 GiB working sets — 86% of the
+8 TB/s spec figure, which is normal for a copy kernel and is the right number for a
+roofline denominator.
+
+**Every roofline percentage in Sessions 14–15 used 8 TB/s and is therefore too
+generous**, including "expert GEMMs at 84% of bound". Worse, redoing attention with
+the correct denominator makes it *impossible*: 315 MB/layer of KV at 6.85 TB/s needs
+45.9 µs/layer, and attention measures 25.2. A measured cost below its own computed
+bound means the byte estimate is wrong, not that the kernel is superhuman — the
+likely suspects are the assumed ~600-token average KV length and how many requests
+are actually active per replay. **No attention roofline claim should be quoted until
+that is resolved by counting bytes from the code rather than from the config.**
+
+### FULL-ATTRIB-S16 — the accounting closes, and the dense projections are the surprise
+
+Three more sites (`qkv_proj`, `out_proj`, `router_topk`) take the block from 84.6%
+attributed to **101.8%** — sum of sites 7.747 ms against a 7.608 ms block. The 1.8%
+over-count is the instrumentation's own inflation plus the constant-bias
+approximation, so the block is now effectively fully accounted for. Ranks 0 and 2
+agree within 6% on every site.
+
+| component | µs/layer | ms/step | % of block | bf16 roofline @6.85 TB/s | % of bound |
+| --- | --- | --- | --- | --- | --- |
+| `expert_gemm_fc1` | 36.7 | 1.763 | 23.2% | 29.4 µs (201 MB) | 80% |
+| `expert_gemm_fc2` | 26.1 | 1.253 | 16.5% | 14.7 µs (101 MB) | **56%** |
+| `attn_core` | 24.6 | 1.180 | 15.5% | see HBM-BW-S16 | unresolved |
+| `nvls_dispatch` | 17.1 | 0.819 | 10.8% | n/a (barrier) | n/a |
+| `nvls_combine` | 13.5 | 0.649 | 8.5% | n/a (barrier) | n/a |
+| `out_proj` | 12.1 | 0.581 | 7.6% | 2.4 µs (16.8 MB) | **20%** |
+| `qkv_proj` | 10.6 | 0.508 | 6.7% | 3.1 µs (21 MB) | **29%** |
+| `moe_align` | 8.7 | 0.418 | 5.5% | n/a | n/a |
+| `moe_sum` | 7.9 | 0.377 | 5.0% | n/a | n/a |
+| `router_topk` | 4.1 | 0.197 | 2.6% | n/a | n/a |
+| **sum** | | **7.747** | **101.8%** | | |
+
+The norm fusions are not instrumented and the sum already exceeds the block, which
+is its own small result: after QWEN-026/027/028 the norms no longer occupy
+measurable standalone time.
+
+**The dense attention projections are the finding: 1.089 ms/step (14.3%) at 20-29%
+of roofline.** Session 15 dismissed them at "0.23 ms, negligible" — that estimate
+was 4.7× low because it was a *bandwidth* estimate for GEMMs that turn out to be
+latency-bound. At M=256 tokens, `qkv_proj` (N=5120, K=2048) needs 3.1 µs on
+bandwidth and ~2.4 µs on FLOPs, and takes 10.6; `out_proj` takes 12.1 against
+2.4. Two skinny GEMMs, each ~3-5× off both of their own bounds. **~0.8 ms of
+headroom, against a total gap of 1.14 ms** — and unlike the collectives, nothing
+about this is cross-rank or barrier-shaped.
+
+Corrected headroom, all measured against 6.85 TB/s:
+
+| target | measured | bound | headroom |
+| --- | --- | --- | --- |
+| dense projections (qkv + out) | 1.089 ms | ~0.27 ms | **~0.8 ms** |
+| NVLS collectives (overlappable, not removable) | 1.468 ms | n/a | up to 1.47 ms |
+| `expert_gemm_fc2` | 1.253 ms | 0.787 ms | ~0.47 ms |
+| `expert_gemm_fc1` | 1.763 ms | 1.44 ms | ~0.32 ms |
+
+### VLLM-COMM-S16 — vLLM runs the same AllGather+ReduceScatter, so "0 exposed comm" was wrong
+
+`PROFILE-OSL1024`, `PROFILE-DECODE` and the Session 8 recommendation all assert that
+vLLM's MoE path has **0 exposed comm** and that mcore's dispatch/combine is therefore
+pure deficit. Direct query of `nsys_trace/vllm_baseline_osl1024.sqlite` falsifies this.
+vLLM's steady state contains exactly two collectives, and they are the same two
+mcore uses:
+
+| | kernel | launches/rank | µs/launch | ms/step |
+| --- | --- | --- | --- | --- |
+| dispatch | `ncclDevKernel_AllGather_RING_LL` | 48,752 | 20.9 | 1.005 |
+| combine | `ncclDevKernel_ReduceScatter_Sum_bf16_RING_LL` | 48,740 | 20.6 | 0.987 |
+
+48,752 = 48 layers × 1016 decode steps exactly — one pair per MoE layer per step, the
+same cadence as mcore's `NVLSAllGatherVDispatcher`. There is **no all-to-all anywhere in
+the trace**: no DeepEP, no pplx-kernels, no `nccl*AllToAll`. Note also that neither
+framework uses an all-to-all dispatcher, so the recurring "all-to-all" shorthand for
+this path (including in `QWEN-005b`) is a misnomer — it is AllGatherV in, ReduceScatterV
+out, every token broadcast to every rank.
+
+The only difference is transport: NCCL ring/LL for vLLM, NVLink multimem on symmetric
+memory for mcore. On the one clean measurement each way, mcore is *ahead*: 30.6 µs/layer
+(`FULL-ATTRIB-S16`, in-graph events, unprofiled) against vLLM's 41.5 µs/layer.
+
+Two caveats bound how hard that comparison can be leaned on. mcore's collectives read
+433 µs and 91 µs per launch **in the profile** — 25× nsys spin-wait inflation, per
+`NSYS-OVERHEAD-S12`; only the in-situ number is usable. And vLLM's 41.5 µs is itself
+measured under nsys, where RING_LL also spins, so its true cost lies somewhere between
+the ~1.2 µs wire floor for ~1 MB over NVLink5 and 41.5 µs, and this trace cannot pin it.
+
+What survives is the structural claim, which is the useful one: **mcore has no
+architectural disadvantage in the MoE collective** — same algorithm, same launch
+cadence, better transport. And since both sides sit 15-30× above the wire time for the
+bytes they move, **both are barrier-latency bound, not bandwidth bound**, which is why
+QWEN-017's transport swap failed and why overlap, not a faster wire, is the only lever
+left here. Correspondingly, the 1.47 ms is *not* free money relative to vLLM: the
+differential is unmeasured and is certainly far smaller than 1.47 ms.
+
+### GAP-DECOMP-S17 — compute is at parity; the gap is kernel count. (Idle magnitude partly retracted — see GRAPH-LAUNCH-S17)
+
+> **Read the caveat first.** The per-component *kernel* comparison below is sound and is
+> what identified the real lever. The **idle magnitude and its attribution are not**:
+> `GRAPH-LAUNCH-S17` shows that node-level graph tracing inflates the host side of a
+> graph launch ~20×, by an amount comparable to the entire idle budget, and mcore pays
+> more of it than vLLM by having more graph nodes. Treat "77% of the gap is GPU idle" as
+> unproven. The surviving claim — mcore runs ~42% more kernels per step, and cutting them
+> pays — is confirmed by QWEN-036.
+
+First like-for-like decomposition of both sides: same window methodology, both traces
+`--cuda-graph-trace=node`, steady-state decode only, one rank, step count derived from
+the one-per-layer collective. Scripts: `nsys_trace/busy_union.py`, `gap_profile.py`,
+`stall_detail.py`. GPU busy is the **union** of kernel intervals, not the sum — the sum
+overcounts whenever streams overlap, which is exactly where vLLM wins.
+
+| per step, rank 0 | mcore | vLLM | delta |
+| --- | --- | --- | --- |
+| wall | 8.571 ms | 7.456 ms | **+1.115** |
+| GPU busy (interval union) | 6.926 ms | 6.674 ms | +0.252 |
+| GPU idle (wall − union) | **1.645 ms** | **0.783 ms** | **+0.862** |
+| sum-of-kernel-durations | 6.970 ms | 7.030 ms | −0.060 |
+| kernel launches | 1163 | 817 | +346 |
+
+**77% of the gap is GPU idle. mcore's compute is at parity or better.** Both profiled
+wall times track the unprofiled throughput (mcore 8.571 vs 8.787, vLLM 7.456 vs 7.53),
+so these windows are representative and nsys is not distorting the totals.
+
+Per-component, profiled against profiled (ms/step):
+
+| component | mcore | vLLM | delta |
+| --- | --- | --- | --- |
+| expert GEMM | 2.502 (`_fused_moe_kernel`, 96) | 2.411 (2× cutlass `bmm`, 94) | +0.09 |
+| attention | 0.796 (FA2 sm100, 48) | 0.820 (`fmhaSm100f`, 48) | −0.02 |
+| collectives | 0.847 | 1.629 | **−0.78** |
+| dense GEMM + splitK reduce | 1.036 | 0.910 | +0.13 |
+| routing / align / sum / topk | 0.559 | 0.702 | −0.14 |
+| norms | 0.515 (193 launches) | 0.426 (189) | +0.09 |
+| misc elementwise / rotary / kv | 0.643 (241+96) | 0.125 (48) | **+0.52** |
+
+**This retracts the Session 16 target list.** `FULL-ATTRIB-S16` put the dense projections
+at 20-29% of roofline with ~0.8 ms of headroom; in the clean trace they are 1.036 ms
+against vLLM's 0.910 — **0.13 ms apart, not 0.8**. The in-situ event pairs inflated every
+site they measured (~2.2 µs/pair × 2 pairs × 48 layers), which is why the instrumented
+sites summed to 7.747 ms against a clean 6.97 ms. **Do not size a target from in-situ
+numbers; size it from a clean trace and only use in-situ for apportionment.** Likewise
+`expert_gemm_fc2` at "56% of roofline" is not a vLLM deficit: vLLM's FC2 equivalent is
+only 0.09 ms cheaper across *both* expert GEMMs.
+
+Where the 1.645 ms of idle sits (`gap_profile.py`):
+
+| gap band | mcore | vLLM |
+| --- | --- | --- |
+| >100 µs | 0.840 ms (2.1 gaps) | 0.399 ms (1.0 gap) |
+| 20-100 µs | 0.163 ms (3.7) | ~0 |
+| 5-20 µs | 0.070 ms (5.8) | 0.002 ms |
+| 2-5 µs | ~0 | 0.343 ms (95.6) |
+| <1 µs | **0.535 ms (1033 gaps)** | 0.038 ms (240) |
+
+Two co-equal levers, and one non-lever:
+
+1. **Two once-per-step host stalls, 0.776 ms** — a ~492 µs gap after
+   `at::native::index_elementwise_kernel` and a ~289 µs gap after
+   `CatArrayBatchedCopy_vectorized` (`torch.cat`), once each per step. vLLM's single
+   equivalent stall is 0.30 ms, so **~0.48 ms is available**. On the rare steps where
+   this blows out to 4 ms, the API trace shows the mechanism: **278 `cudaMemcpyAsync` +
+   270 `cudaStreamSynchronize` in one gap** — a per-request D2H sync storm that should be
+   one batched copy. This is the between-step Python phase that HOST-IDLE-S13/14/15
+   hunted and missed; GPU-side gap analysis found it where host sampling could not.
+2. **Serialization, ~0.5 ms** — mcore has 1033 sub-µs gaps against vLLM's 240, and gets
+   essentially *no* stream concurrency (union 6.926 ≈ sum 6.970) while vLLM recovers
+   0.36 ms through overlap (union 6.674 vs sum 7.030). Driven by kernel count: the +346
+   excess launches are **~241 standalone elementwise kernels** (`elementwise_kernel` 96,
+   `triton_poi_fused_add_copy__0` 96, `vectorized_elementwise` 49 — the residual adds,
+   which vLLM fuses into its RMSNorm, cf. the `add` in
+   `triton_red_fused__to_copy_add_mean_mul_pow_rsqrt`), **90 `splitKreduce` kernels** that
+   vLLM has none of, and 96 rotary/append-kv against vLLM's 48. Caveat: node-level graph
+   tracing costs per node, so an unknown part of the 0.535 ms is CUPTI overhead that mcore
+   pays more of by having more nodes. The kernel-count difference underneath is real.
+3. **Not a lever: the collectives.** mcore is 0.78 ms/step *ahead* on comm, consistent
+   with `VLLM-COMM-S16`. It is the single largest thing mcore is winning, and the reason
+   the compute totals come out even despite the elementwise sprawl.
+
+### Session 16 — conclusion & recommendation
+
+The gap to vLLM is ~1.14 ms/step (29,133 vs 33,994 tok/s at a ~7.97 ms step). The
+block is now fully attributed, and there is more identified headroom (~1.6 ms
+excluding the collectives) than gap. Ordered by headroom-per-unit-risk:
+
+0. **The dense attention projections, ~0.8 ms of headroom** (FULL-ATTRIB-S16) — the
+   cheapest target and the one this session found by accident. Two skinny
+   M=256 GEMMs at 20-29% of their own bounds, latency-bound rather than
+   bandwidth-bound, with no cross-rank behaviour to reason about. Start here.
+1. **The NVLS collectives, 1.47 ms — but demoted, see VLLM-COMM-S16.** vLLM runs the
+   same AllGather+ReduceScatter at the same cadence and pays for it too, so this is
+   not 1.47 ms of deficit against vLLM; the differential is unmeasured and much
+   smaller. Removal is impossible (they carry the tokens) and replacing the transport
+   already failed once (QWEN-017), and both sides are barrier-latency bound rather
+   than bandwidth bound, so the only lever is **overlap**: chunk the expert GEMM and
+   overlap combine of chunk *i* with the GEMM of chunk *i+1*, or prefetch the next
+   layer's dispatch. The 81% layer spread says part of this cost is skew absorption,
+   so some of it may be recoverable by better arrival balance rather than by
+   overlap. Worth doing eventually, but it is no longer the item that "alone would
+   close the gap."
+2. **FC2, ~0.3–0.6 ms of apparent inefficiency** — 26.5 µs/layer against 14.8 µs at
+   the corrected roofline, and against FC1 doing twice the work for 1.4× the time.
+   Cheaper to investigate than item 1 and independently useful. Note
+   `MCORE_MOE_GEMM_TUNE` already tunes FC1/FC2 tiles separately, so this is a
+   question about that tuning, not about its absence.
+3. **Recount the attention KV bytes** before any attention work, per HBM-BW-S16.
+4. Precision (FP8 KV cache, FP8/NVFP4 experts) remains the only lever on whatever
+   genuinely is bandwidth-bound, and still needs its own correctness evaluation.
+
+### GRAPH-LAUNCH-S17 — the 191 µs `cudaGraphLaunch` was a profiler artifact; real cost is 9 µs
+
+`GAP-DECOMP-S17` decomposed mcore's 1.645 ms/step of GPU idle and found
+`cudaGraphLaunch` inside those gaps at **4 calls/step × 191.6 µs = 761 µs/step**, which
+would have made it the single largest item in the idle budget. Measuring it without a
+profiler (`megatron/core/inference/graph_launch_timing.py`, `MCORE_GRAPH_LAUNCH_TIMING=1`,
+`perf_counter` around `torch.cuda.CUDAGraph.replay`) shows the hot graph replaying in
+**median 9.0-10.0 µs, p90 ~12 µs** over 1404 replays. The profiled figure was inflated
+**~20×** by `--cuda-graph-trace=node`, which makes the driver do per-node bookkeeping
+inside the launch.
+
+Graph launch is therefore ~40 µs/step, not 761 — **not a lever**, and the two 460-1000 µs
+replays that do exist are `n=1` first-touch of each freshly captured bucket, not steady
+state.
+
+**This partially retracts `GAP-DECOMP-S17`.** Its per-component *kernel* numbers stand —
+kernel durations are barely perturbed, and that half of the analysis is what identified
+the kernel-count gap. But the **magnitude and attribution of the 1.645 ms idle are not
+trustworthy**, because the host side of a node-traced graph launch is inflated by an
+amount that happens to be the same order as the whole idle budget, and mcore pays more of
+it than vLLM by having more nodes. Do not quote "77% of the gap is GPU idle" without this
+caveat. What survives, and is confirmed by QWEN-036 below, is the weaker and still
+actionable claim: **mcore runs ~42% more kernels per step than vLLM and that costs real
+throughput.**
+
+Method note for the next session: a profiler cannot be used to size an overhead the
+profiler itself creates. Any host-side cost read out of a node-traced profile must be
+re-measured with `perf_counter` before it becomes a target.
+
+### FUSION-INERT-S17 — the residual-add fusion was written, gated on, and never firing
+
+`QWEN-026/027/028` built `fused_add_rmsnorm` for both transformer-block boundaries.
+`MCORE_FUSED_ADD_NORM=1` was in the standing gate list and the config that produced
+`nsys_trace/mcore-final-jul27` is labelled "all ten gates on" — yet that trace contains
+**zero** fused-add-norm kernels and exactly the two-kernel pattern the module's own
+docstring describes as the thing it replaces (`triton_poi_fused_add_copy__0` at 96/step =
+2/layer, plus 193 standalone TE RMSNorms).
+
+`megatron/core/inference/fusion_diag.py` (`MCORE_FUSION_DIAG=1`) reports each site's
+guard conjunction once per distinct verdict. Two findings:
+
+1. Both sites **do engage** at 256 tokens. The blocked verdicts are all at
+   `(512, 1, 2048)` — prefill, correctly excluded by `MCORE_FUSED_ADD_NORM_MAX_TOKENS=256`.
+2. The second site, `mlp_bda+next_layer_qkv_norm`, needs `MCORE_FUSED_ADD_NORM_QKV=1`,
+   which **was never in any gate list**. Worse, the two sites are *coupled*:
+   `_forward_pre_mlp_layernorm` only sets `self.mlp_norm_manager` when the attention-side
+   fusion did *not* fire, and the MLP-side guard requires `mlp_norm_manager is None`. So
+   the MLP-side fusion is eligible only on layers where the attention-side one already
+   fired — a dependency neither gate's name nor docstring mentions.
+
+Diagnostic lesson: report guards **once per distinct verdict, not once per site**. The
+first version reported only the first call, which is prefill, and therefore said "BLOCKED"
+about a fusion that engages fine in decode — the exact wrong conclusion.
+
+### QWEN-036 — enable the second fusion boundary (`MCORE_FUSED_ADD_NORM_QKV`): **+2.8%**
+
+Same node, same session, same allocation, back-to-back arms; only the one gate differs.
+Node `nvl72104-T17`, Slurm `5792909`, BS256 / OSL1024 / 2 warmup + 5 timed.
+
+| arm | gates | per-iter throughput (tok/s) | mean | TPOT |
+| --- | --- | --- | --- | --- |
+| `a1base` | standing 12 + FA2 | 26803, 26871, 27111, 27176, 27947 | **27,182** | 9.420 ms |
+| `a2qkv` | + `MCORE_FUSED_ADD_NORM_QKV=1` | 27589, 27718, 28092, 28172, 28200 | **27,954** | 9.159 ms |
+
+**+2.84%, −0.261 ms/step.** 3 of 5 `a2qkv` iterations beat *every* `a1base` iteration, and
+the arms' means are separated by more than either arm's spread, so this clears the ~4%
+per-iteration noise. Coherence checked in both arms.
+
+Note the absolute numbers: `a1base` is 27,182 on this node against the 29,133 recorded for
+the same configuration in Session 16. **Node-to-node variation is larger than most of the
+wins in this ledger** — roughly 7%. Never compare an arm against a historical number;
+always re-measure the baseline in the same allocation. The gap to vLLM cannot be restated
+from this session because no same-node vLLM run was taken.
+
+This is the first confirmation of the `GAP-DECOMP-S17` strategy: the change removes
+kernels rather than making any kernel faster, and it converted directly into throughput.
+
+### QWEN-037 / QWEN-038 — two env-only follow-ups, both neutral
+
+Same allocation as QWEN-036, so each is directly comparable to the `a2qkv` arm
+(27,954 tok/s) without re-running a baseline.
+
+| arm | change | mean tok/s | vs `a2qkv` |
+| --- | --- | --- | --- |
+| `b1maxtok` | `MCORE_FUSED_ADD_NORM_MAX_TOKENS=512` | 27,862 | −0.33% |
+| `b2nosplitk` | `CUBLASLT_WORKSPACE_SIZE=1` | 27,811 | −0.51% |
+
+**QWEN-037** aimed at the 9.2 boundaries/step that still fall back to the unfused path
+(96 possible − 86.8 fused). Raising the token ceiling did not recover them and cost
+slightly, so those fallbacks are not token-count rejections. One is layer 47, whose
+`mlp_bda` has no next layer to donate a norm to; the rest are most likely the coupling in
+`FUSION-INERT-S17` (a layer is eligible on the MLP side only if the attention side fired).
+
+**QWEN-038** tried to delete the ~76 `splitKreduce` launches/step (0.185 ms of kernel
+time) by starving the cuBLASLt workspace that split-K algorithms require. Neutral. Two
+readings, and the second is the important one: either the heuristic ignored the limit, or
+it switched to non-split-K kernels that gave back exactly what the reduce cost. **The run
+did not verify which**, so "split-K removal doesn't pay" is not yet established — only
+"this way of attempting it doesn't." A profile of the arm would settle it.
+
+### LAUNCH-VS-WORK-S17 — the QWEN-036 win came from removed GPU work, not removed launches
+
+Worth pinning down, because the two readings of QWEN-036 point at completely different
+next targets, and the launch-count reading is the wrong one.
+
+The fusion removed **111 launches/step** *and* **~0.386 ms/step of kernel time** in the
+four affected kernel families:
+
+| family | before (n × µs) | after (n × µs) |
+| --- | --- | --- |
+| `triton_poi_fused_add_copy__0` | 96 × 1.27 | 9.2 × 2.35 |
+| `at::native::elementwise_kernel<128,4>` | 96 × 2.56 | 52.1 × 3.11 |
+| `rmsnorm_fwd_tuned` | 85.1 × 2.73 | 9.8 × 3.36 |
+| `rmsnorm_fwd_general` | 96 × 1.95 | 8.3 × 3.50 |
+| `_fused_add_rmsnorm_kernel` | — | 86.8 × 1.79 |
+| **total** | **0.787 ms** | **0.401 ms** |
+
+The measured end-to-end saving was **0.261 ms/step — 68% of the 0.386 ms of kernel time
+removed**, which is what partial overlap predicts. It is *not* explained by launch count:
+QWEN-038 attacked 76 launches carrying 0.185 ms and returned nothing, and
+`GRAPH-LAUNCH-S17` already showed launch submission costs ~10 µs, not the ~180 µs the
+launch-bound reading needs.
+
+**So size every remaining candidate by the GPU work it deletes, not by how many kernels it
+deletes.** Under that rule the routing-mask kernel — 48 launches/step but only
+48 × 0.97 µs = 0.047 ms — is worth at most ~0.5% and is *not* the next lever, despite
+being the most attractive item on a launch-count ranking. This also retires the last
+operational use of `GAP-DECOMP-S17`'s "+346 excess launches" framing: the launch delta is
+a symptom of unfused work, and the work is what costs.
+
+Ranked by kernel time, the remaining decode candidates are `_moe_sum_kernel_fast`
+(48 × 5.81 = 0.279 ms), `_align_single_kernel` (39.5 × 4.67 = 0.185 ms), the residual
+`elementwise_kernel<128,4>` (52.1 × 3.11 = 0.162 ms, identity not yet established), and
+`_fused_qk_rmsnorm` (0.105 ms). Caveat on all four: these averages come from a profile
+whose window was not restricted to steady-state decode, so they are inflated by prefill
+instances and are ranking hints, not budgets.
+
+### QWEN-039 — raise `CUDA_DEVICE_MAX_CONNECTIONS` from 1 to 8: **+0.9%, provisional**
+
+`GAP-DECOMP-S17` observed that mcore gets essentially no stream concurrency (interval
+union 6.926 ms ≈ sum-of-durations 6.970 ms) while vLLM recovers 0.36 ms through overlap.
+The harness pins `CUDA_DEVICE_MAX_CONNECTIONS=1` (`dev/moe_fused/run_e2e_cfg.sh`), which
+puts every stream on one hardware channel and serializes work that has no data dependency
+— notably the shared-expert stream against the main stream. Env-only test:
+
+| arm | `CUDA_DEVICE_MAX_CONNECTIONS` | mean tok/s | vs `a2qkv` |
+| --- | --- | --- | --- |
+| `a2qkv` | 1 | 27,954 | — |
+| `c2conn4` | 4 | 27,999 | +0.16% |
+| `c1conn8` | 8 | **28,214** | **+0.93%** |
+
+**Provisional, not confirmed.** All 5 of `c1conn8`'s iterations sit above `a2qkv`'s mean,
+which is suggestive, but the two arms' per-iteration spreads overlap (553 and 611) and the
+allocation expired before a repeat could be run. **Re-run `a2qkv` and `c1conn8` back to
+back before believing +0.9%**, and note that `=1` is often set deliberately to keep
+collectives from being starved of channels, so a confirmation should check the collective
+timings too, not just throughput.
+
+Session best configuration: standing 12 gates + FA2 + `MCORE_FUSED_ADD_NORM_QKV=1` +
+`CUDA_DEVICE_MAX_CONNECTIONS=8` = **28,214 tok/s, +3.80%** over the same node's baseline
+of 27,182.
+
+### BUDGET-S17 — first trustworthy per-kernel decode budget, and how to window a trace
+
+Every per-kernel table before this one was taken over a window that included model load,
+graph capture, warmup and the gaps *between* benchmark iterations. That inflates
+`wall/step` without bound and pollutes every average with prefill instances — it is why an
+earlier pass of this same trace reported `wall/step=199 ms` and a 6.5 ms
+`_fused_metadata_kernel`. `nsys_trace/steady_window.py` locates the window from the cadence
+of the one-per-layer-per-step collective, takes the last *N* whole steps, and **warns when
+the span still contains an inter-iteration gap**. Narrowing 150 → 60 steps moved
+`wall/step` from 34.6 ms to 7.217 ms and `_fused_metadata_kernel` from 13,182 µs to 116 µs.
+
+> **Always run the window guard.** Two sessions' worth of component sizing was distorted by
+> unwindowed spans. If `wall/step` does not land near the throughput-derived step time,
+> the window is wrong and nothing else in the table means anything.
+
+Config: both fusion boundaries on, FA2, BS256, **OSL128** (`wall/step` 7.217 ms; the
+OSL1024 regime is 9.16 ms, the difference being KV-length-dependent attention). 60 steps,
+rank 0, `sum-of-durations` 5.627 ms/step over 1025 launches.
+
+| ms/step | n/step | avg µs | group |
+| --- | --- | --- | --- |
+| 1.949 | 96 | 20.31 | `_fused_moe_kernel` — expert GEMMs, **35% of all kernel time** |
+| 0.769 | 34-14 | 3.4-6.7 | dense projection GEMMs (`nvjet_*`) |
+| 0.759 | 48+48 | 9.33/6.49 | NVLS collectives (reduce-scatter 0.448 + all-gather 0.311) |
+| 0.558 | 34-14 | 4.3-10.4 | FlashAttention decode + splitkv combine |
+| 0.218 | 48 | 4.54 | `_moe_sum_kernel_fast` |
+| 0.217 | 48 | 4.52 | `_align_single_kernel` |
+| 0.179 | 48+34 | 2.05/2.33 | `cublasLt::splitKreduce` |
+| 0.168 | 95 | 1.77 | `_fused_add_rmsnorm_kernel` (the QWEN-036 fusion) |
+| 0.127 | 48 | 2.66 | `at::native::elementwise_kernel<128,4>` — 1/layer, **identity unknown** |
+| 0.085 / 0.084 / 0.070 / 0.062 / 0.036 | 48 each | ~0.8-1.8 | qk_rmsnorm, rotary, softmax_topk, append_kv, mask_routing_padding |
+
+Sized by `LAUNCH-VS-WORK-S17`'s rule (removed GPU work × ~68% conversion, against the
+9.16 ms OSL1024 step), the ranked remaining candidates are:
+
+1. **`_fused_moe_kernel`, 1.949 ms — the only large target left.** No fusion helps here;
+   it is bandwidth-bound (FC1 at 80% of achievable HBM, FC2 at 56%). The lever is fewer
+   bytes, i.e. **FP8 expert weights**, worth up to ~0.9 ms. This is the one item whose
+   payoff justifies a large implementation.
+2. `_moe_sum_kernel_fast` + `_align_single_kernel`, 0.435 ms combined → ~1.5-3% if folded
+   into neighbours. Both are already single-kernel-per-layer, so this means changing what
+   they are fused *with*, not fusing them together.
+3. `elementwise_kernel<128,4>`, 0.127 ms → ~0.9%. **Identify it first**: one per layer at
+   2.66 µs, and if it is a stray cast or copy it may be removable outright rather than
+   fused. Cheapest next step in the list and the only one that starts with a question
+   rather than a kernel.
+4. `_mask_routing_padding_kernel`, 0.036 ms → ~0.3%. Explicitly **not worth it**, recorded
+   here only because a launch-count ranking puts it near the top (48/step).
+
+### FP8-WEIGHTS-S18 — candidate 1 above is dead: fewer bytes does not mean less time
+
+Weight-only fp8 (e4m3, one fp32 scale per output channel, activations and accumulation
+unchanged) was implemented end to end — `moe/fp8_experts.py`, an `FP8_WEIGHTS` path in
+`_fused_moe_kernel`, quantized buffers built in `_build_concatenated_weights` — and it
+**loses at every tile configuration**, so the 0.9 ms above is not available this way.
+
+| GEMM | best bf16 | best weight-only fp8 | fp8 penalty |
+| --- | --- | --- | --- |
+| FC1 (+SwiGLU epilogue) | **36.24 µs** @ M16 N64 K64 w4 s3 | 40.08 µs @ M32 N64 K128 w8 s4 | +10.6% |
+| FC2 | **18.86 µs** @ M32 N256 K64 w8 s4 | 22.24 µs @ M32 N256 K128 w4 s3 | +17.9% |
+
+Numerics were never the problem: cosine similarity 0.9989, mean relative error 6.6e-2
+concentrated in near-zero outputs, weight bytes 302.0 → 151.5 MB/layer exactly as intended.
+
+**Why halving the bytes cannot help here.** With bf16 activations every fp8 weight tile must
+be widened back to bf16 in registers before the MMA, one convert per weight element. The
+best bf16 configs run at 5.55 TB/s (FC1) and 5.34 TB/s (FC2) — ~90% of this part's
+achievable HBM — so the byte saving is worth at most ~45% of each kernel, and the converts
+cost more than that. The fp8 arms land at 40/22 µs against an fp8 *bandwidth* floor of
+~18/9 µs, i.e. once the bytes are halved the kernel is no longer bandwidth-bound at all.
+The only version of this lever that can pay is **w8a8**, where activations are also fp8 and
+the tensor cores consume both operands directly with nothing converted.
+
+> **Two measurement traps, both of which produced a wrong answer first.**
+> 1. An earlier harness reported fp8 at 0.995× and was read as "no effect". It was timing
+>    **Python**: four Triton launches per call, ~153 µs/call, host-bound with the GEMM
+>    invisible underneath. Any A/B of a <50 µs kernel must time **graph replay**, not a
+>    launch loop — `harness_gemmgrid.py` captures one launch and replays it.
+> 2. `_get_decode_tuned_configs`' shipped tiles were re-derived independently by this sweep
+>    and are **already optimal**, including the shared `BLOCK_SIZE_M=16`: M32 makes FC2 13%
+>    faster (21.33 → 18.86 µs) but FC1 10% slower, and the two share one indirection table,
+>    so M16 wins on the sum (57.6 vs 58.8 µs). Retuning tiles is closed.
+
+Combined with QWEN-014 (flashinfer cutlass, 0.921×) and QWEN-010 (torch grouped_mm, 0.82×),
+**every dtype-preserving and vendor-kernel route into the expert GEMM has now been measured
+and none beats the shipping Triton path.** The candidate list above should be read as: item 1
+requires w8a8 or nothing; items 2-4 are the only cheap ones left.
+
+### STATUS-S18 — mcore at 87.9% of vLLM; the remaining gap is packing, not work
+
+| | tok/s | ms/step | vs vLLM |
+| --- | --- | --- | --- |
+| vLLM DP4+EP (`VLLM-BASELINE` / `PROFILE-OSL1024`) | 33,994.5 | 7.53 | — |
+| **mcore, current best** (`y2pdl`) | **29,898.3** | **8.56** | **87.9%** (vLLM 1.137x) |
+| mcore at session-18 start | 28,594.3 | 8.95 | 84.1% |
+| mcore at session-2 start (`SESSION2-BASE`) | 22,398.9 | 11.71 | 65.9% |
+
+Session 18 closed 0.35 ms of the 1.38 ms/step gap (**+4.56%**), from three changes that
+stack: `QWEN-040` bf16 MoE combine (+2.5%), `QWEN-041` flashinfer trtllm-gen decode
+(+1.7%), `QWEN-042` PDL on that kernel (+0.3%).
+
+**Attention is now at parity, and that closes the largest work-bucket gap.** In the final
+trace it runs 22.9 us/launch against vLLM's 25.3 us -- both engines now execute the same
+trtllm-gen kernel family, and what is left of the difference is window seqlen, not
+kernel quality. The 0.409 ms/step deficit `GAP-S18` measured is gone.
+
+What remains, in order:
+
+1. **Serialization, ~0.3 ms.** mcore's sum-of-durations (5.922 ms) and interval union
+   (5.877 ms) differ by 0.8%, so **almost nothing overlaps**; vLLM hides 4.8% of its work.
+   mcore's 0.905 ms/step of collectives is fully exposed against compute. This is now the
+   single largest structural difference and it is a scheduling change, not a kernel.
+2. **Dispatch overhead, 0.416 ms.** 806 sub-microsecond gaps per step, at 963 launches
+   against vLLM's 810. Priced by `BALLAST-S18` at ~0.5 us of gap per node, so each fusion
+   still pays twice.
+3. **Work vLLM does not do at all**: splitK reduce 0.167 ms/step (82 launches, no vLLM
+   equivalent) and the 0.164 ms of copies whose origin is still open after four attempts
+   (`COPY-ID-S18` -- `SplitAlongDim` eliminated).
+
+> **Reading the trace tables above.** Per-bucket ms/step may only be compared *within* one
+> trace. This window's attention is 22.9 us/launch against the harness's 45.1 us at KV
+> length 512, which puts its average KV length near 260 -- so its absolute times are
+> cheaper than the run average and not comparable to the earlier traces'. The throughput
+> column is the authority; the buckets rank levers, they do not size them.
+
+### QWEN-042 — PDL on the flashinfer decode kernel: **+0.30%**
+
+| arm | gates | tok/s | vs control |
+| --- | --- | --- | --- |
+| x2fi | control (flashinfer decode) | 29,802.9 | — |
+| y1pdl | + `MCORE_FLASHINFER_PDL=1` | 29,888.2 | +0.29% |
+| y2pdl | repeat | 29,898.3 | +0.32% |
+
+Programmatic Dependent Launch lets the kernel's prologue start while its predecessor
+drains, aimed at the 0.416 ms/step of sub-microsecond gaps. Small but reproducible across
+two arms, and above the 0.5% iteration spread only because both arms agree; kept on the
+strength of the repeat rather than the single measurement.
+
+### QWEN-041 — Blackwell-native decode attention via flashinfer trtllm-gen: **+2.61%**
+
+| arm | gates on top of standing set (incl. `MCORE_NVLS_RS_BF16=1`) | tok/s | vs control |
+| --- | --- | --- | --- |
+| x1base | control (FA2 decode) | 29,043.8 | — |
+| **x2fi** | **`MCORE_FLASHINFER_DECODE=1`** | **29,802.9** | **+2.61%** |
+
+`GAP-S18` put attention 0.409 ms/step behind vLLM at an *identical* launch count, which
+rules out anything Megatron does around the call and points at the kernel generation:
+Megatron's decode runs FA2's `flash_attn_with_kvcache`, whose kernels predate Blackwell,
+while vLLM reaches `fmhaSm100f` through flashinfer. flashinfer 0.6.14 turned out to be
+**already installed** in the same venv as flash-attn, so this needed no new dependency.
+
+Measured in isolation first (`dev/moe_fused/harness_attn.py`), at B=256, 32 q heads,
+4 kv heads, D=128, under graph replay so the number is device time and not Python:
+
+| KV len | FA2 | trtllm-gen | delta |
+| --- | --- | --- | --- |
+| 512 | 59.6 us | 45.1 us | −24.3% |
+| 1024 | 105.8 us | 80.7 us | −23.7% |
+| 2048 | 199.3 us | 151.9 us | −23.8% |
+
+A flat ~24% across the range, with outputs matching FA2 to bf16 tolerance (rel ~3e-3).
+Two properties made the integration small: with `kv_layout="NHD"` the kernel takes
+**exactly the paged layout Megatron already has**, and unlike flashinfer's wrapper APIs
+the trtllm-gen entry point needs no host-side `plan()`, so it captures in the decode
+graph. Page size is irrelevant to it (256/128/64 all within 0.1 us), so Megatron's
+256-token pages stay -- and FA2 is the stricter of the two, *requiring* pages be a
+multiple of 256.
+
+The e2e gain (+2.61%) is smaller than the kernel gain (24% of a 1.36 ms bucket would be
+0.33 ms of an 8.8 ms step, or 3.8%) because the removed device time partly un-hides host
+work, the same ~68% conversion `LAUNCH-VS-WORK-S17` measured for the add-norm fusion.
+
+> **Lesson.** The gap said "attention, same launch count, more time", which reads as *our
+> kernel is the wrong generation for this GPU* -- and the right kernel was already sitting
+> in the venv. Before treating a kernel-quality gap as a porting project, check what the
+> reference implementation calls and whether it is installed: two sessions of FA2-vs-FA4
+> flag flipping never left the flash-attn package, where the answer was not.
+
+### QWEN-040 — reduce the MoE combine in bf16, not fp32: **+2.37%**
+
+| arm | gates on top of standing set | tok/s | vs control |
+| --- | --- | --- | --- |
+| s1base | control (FA2) | 28,594.3 | — |
+| **t1rsbf16** | **`MCORE_NVLS_RS_BF16=1`** | **29,271.8** | **+2.37%** |
+| t2rsbf16 | repeat of t1 | 29,354.2 | +2.66% |
+| t3rsconn8 | + `CUDA_DEVICE_MAX_CONNECTIONS=8` | 29,346.3 | +0.0% vs t2 |
+| s2fa4 | FA4 (version pin removed) | 27,716.1 | −3.07% |
+| s3conn8fa4 | FA4 + `CUDA_DEVICE_MAX_CONNECTIONS=8` | 27,812.6 | +0.35% vs s2fa4 |
+
+Found by following `COPY-ID-S18`'s post-reduce-scatter copy back to its cause rather
+than trying to fuse it away. The copy is `output.to(torch.bfloat16)` in
+`NVLSAllGatherVDispatcher.combine`, and it exists because the `ep_rsv` symmetric buffer
+is allocated fp32 — so the MoE writes fp32 through `_moe_sum`'s `out=`, the combine
+reduce-scatter moves **twice the NVLink bytes it needs to**, and every layer pays a cast
+on the way back to a bf16 residual stream. Allocating the buffer bf16 fixes all three at
+once: `_moe_sum`'s `tl.store` casts on the way in for free, and `output.to(bfloat16)`
+becomes a no-op that returns its argument, so the cast kernel disappears.
+
+The precision cost is far smaller than "reduce in bf16" suggests, and this is the part
+worth remembering: `multimem.ld_reduce` **accumulates in f32 regardless** — `REDUCE_F32`
+only selects whether the operands it loads are `f32` or `bf16x2`. So the change halves
+the bytes on the step's largest collective while keeping f32 accumulation in hardware,
+and it lands where vLLM already is (`ncclDevKernel_ReduceScatter_Sum_bf16`). Greedy
+decode stays coherent on all three probes and the five iterations span 0.4%.
+
+Two arms, 29,271.8 and 29,354.2, put the mean at 29,313 (**+2.52%**), and TPOT drops from
+~8.95 to 8.75 ms — 0.23 ms/step against the 0.29 ms predicted from the trace, so the
+accounting holds. Stacking `CUDA_DEVICE_MAX_CONNECTIONS=8` on top adds nothing (29,346),
+which retires `QWEN-039`: that flag's earlier +0.4-0.9% was relieving contention on the
+same fp32 reduce-scatter this change shrinks, so the two are one win, not two.
+
+Left env-gated and **off by default**: it is a numerics change, and enabling it by
+default needs an accuracy run (lm-eval or equivalent), not three greedy-decode probes.
+
+**Mechanism confirmed by launch count, not by time.** A trace captured with the gate on
+shows `bfloat16_copy_kernel` instances falling from 258,564 to 4,572 whole-trace (−98%)
+and the copy bucket falling from 107 to 59 launches/step — exactly 48, one per layer,
+the cast that is now a no-op. Counts are the right evidence here because the two traces'
+*times* are not comparable: the second window's expert GEMM is 27% cheaper (2.436 →
+1.777 ms/step) and its attention launches went 50 → 63, neither of which a
+reduce-scatter dtype can cause. The two 60-step windows simply sit at different average
+sequence lengths, so per-bucket ms/step may only be compared *within* a trace. The
+throughput number in the table above, measured without a profiler attached, is what
+sizes the win.
+
+> **Lesson.** A "removable copy" is usually a symptom. Three sessions treated the
+> per-layer copies as fusion targets worth ~0.06 ms each; the copy was actually pointing
+> at a **buffer dtype** decision upstream worth 2.5%. When a copy shows up next to a
+> collective, check what dtype the collective is moving before trying to fuse the copy.
+
+### FA4-RECHECK-S18 — the FA2 pin survives upstream's split-KV fix
+
+`QWEN-0xx` pinned `MCORE_FLASH_ATTN_VERSION=2` because FA4 hardcoded `num_splits=1` and
+so could not split KV across SMs at decode. The rebase brought `num_splits=0` (auto), so
+the rejection was re-tested per the rebase rule — and FA4 is **still 3.07% slower**
+(27,716 vs 28,594). `num_splits` was therefore not the dominant term; the FA4 path's
+routing through the varlen interface is. Attention stays the largest work-bucket gap
+(+0.409 ms/step) with no env-level lever left, so closing it needs a different kernel
+(flashinfer/TRT-LLM-gen decode), not a flag.
+
+### GAP-S18 — the gap is two-thirds packing, one-third work, and the expert GEMM is done
+
+First decomposition built from a **fresh** mcore trace (current gate set, OSL1024, 60
+steady steps, no window warnings) against the vLLM baseline trace, both bucketed by
+`nsys_trace/compare_budget.py` and both measured for interval-union busy by
+`nsys_trace/union_window.py`. Every prior version of this comparison used the Jul 27
+mcore trace, which predates the FA2 pin and both add+norm fusions and therefore
+overstated attention, norm and copies.
+
+| | vLLM | mcore | delta |
+| --- | --- | --- | --- |
+| GPU busy, interval union | 6.989 ms | 7.478 ms | +0.489 |
+| exposed gap (true step − union) | ~0.54 ms | ~1.43 ms | **+0.89** |
+| step time, unprofiled | 7.53 ms | 8.91 ms | +1.38 |
+
+Per-bucket device time (ms/step, launches/step), mcore minus vLLM:
+
+| bucket | vLLM | mcore | delta |
+| --- | --- | --- | --- |
+| attention | 1.214 (48) | 1.623 (50) | **+0.409** |
+| elementwise / copy | 0.004 (1) | 0.232 (107) | +0.228 |
+| splitK reduce | 0 (0) | 0.204 (95) | +0.204 |
+| MoE finalize | 0.215 (47) | 0.261 (48) | +0.046 |
+| expert GEMM | 2.376 (94) | 2.436 (96) | **+0.060** |
+| norm | 0.251 (95) | 0.272 (145) | +0.021 |
+| MoE routing | 0.475 (142) | 0.367 (144) | −0.108 |
+| collective | 1.607 (94) | 1.035 (96) | **−0.572** |
+| **sum of durations** | **7.341 (810)** | **7.521 (1027)** | **+0.180 (+217)** |
+
+Three conclusions, in order of how much they should change what gets worked on:
+
+1. **Only 0.18 ms of the 1.38 ms gap is extra kernel work.** The expert GEMM is at
+   parity (+0.06 ms) and mcore's collectives are *half a millisecond faster* than
+   vLLM's. Four sessions of MoE GEMM work, `FP8-WEIGHTS-S18` included, were aimed at a
+   bucket that had already converged.
+2. **mcore overlaps nothing.** Sum-of-durations 7.521 vs union 7.478 means 0.6% of its
+   work runs concurrently with other work; vLLM hides 0.352 ms (4.8%). mcore's 1.035 ms
+   of collectives is fully serialized against compute. Matching vLLM's overlap ratio is
+   worth ~0.3 ms and is a scheduling change, not a kernel.
+3. **The gaps are launch-shaped.** 892 of mcore's 934 per-step gaps are sub-microsecond
+   and sum to 0.456 ms — consistent with `BALLAST-S18`'s 1.34 µs/node (~0.85 µs kernel
+   + ~0.5 µs gap) across 1027 launches vs vLLM's 810. Every removed launch pays twice.
+
+### COPY-ID-S18 — both copy families named from the trace, after three failed hooks
+
+The 107 copy launches/step were finally identified **positionally in the trace**, by
+aggregating each copy's immediate predecessor and successor, after three attempts to
+name them with a `TorchDispatchMode` hook produced nothing usable:
+
+| n/step | kernel | sits between | what it is |
+| --- | --- | --- | --- |
+| 47 | `vectorized_elementwise_kernel<8>` (bf16 copy) | `_multimem_reduce_scatter_v` → `_fused_add_rmsnorm` | materializes the MoE output that the next kernel immediately reads |
+| 48 | `elementwise_kernel<128,4>` | QKV GEMM (`nvjet_*`) → `_fused_qk_rmsnorm` | contiguous copy of the strided Q/K slices |
+
+The first one turned out to be a dtype symptom, not a fusion target, and is fixed in
+`QWEN-040` (+2.5%). The second is still open, and the guess in the first version of this
+entry -- "make `_fused_qk_rmsnorm` stride-aware" -- was wrong: that kernel is *already*
+stride-aware and takes no-copy `[-1, head_dim]` views. So the copy is **upstream of the
+norm**, between the QKV GEMM and it, and at 2.66 us it is about the size of a full
+round-trip of the QKV tensor (256 tok x 5120 x 2 B, read+write, at ~3 TB/s).
+
+The prime suspect was `SplitAlongDim` in `Attention.get_query_key_value_tensors`
+materializing q/k/v instead of returning views. **Tested and eliminated**: taking the
+`torch.split` branch instead (`MCORE_QKV_SPLIT_VIEWS=1`, arm `u1qkvsplit`) gives
+29,307 tok/s against the 29,313 control -- exactly neutral. Either TE's split already
+returns views, or `torch.split` + the `[sq, b, np, hn]` reshape materializes the same
+bytes. The copy's source remains open; what is now known is that it is QKV-sized, sits
+between the QKV GEMM and the norm, and is not the split.
+
+A fourth attempt at naming it with `copy_trace` landed in prefill again -- it reported
+`rmsnorm.py:182 op_forward` doing `.contiguous()` on a strided `(512, 1, 4, 128)` K
+tensor, which is TE's norm op on a 512-token prefill, not the decode copy. That is a
+real finding for prefill but not the one being chased, and it is the fourth time this
+hook has answered a different question than the one asked.
+
+> **Lesson on the failed hook.** `copy_trace` was armed three ways: on the first layer
+> forward (caught the one-time lazy expert-weight consolidation and reported 32 weight
+> copies per layer as if per-step), on `inference_context.is_decode_only()` (never fired
+> — under graph capture the context does not reach the layer as a keyword), and finally
+> on a call counter. Meanwhile the trace already contained the answer. **When a kernel
+> needs identifying and a profile exists, read the profile's neighbours first**;
+> instrumenting the framework to re-derive what the trace already recorded cost three
+> allocation slots here.
+
+## Session 19 (2026-08-03) — the QKV copy, named by arithmetic
+
+`COPY-ID-S18` left one kernel unattributed after four attempts: a 2.8 us
+`elementwise_kernel<128,4>` between the QKV GEMM and the q/k norm, once per layer per
+step, QKV-sized. It is the `reshape`, and it is provable on a laptop in ten seconds with
+no GPU, no cluster, and no profiler:
+
+```
+q slice   [sq, b, ng, (np/ng) * hn]   strides (.., .., 1280, 1)
+q reshape [sq, b, np, hn]             strides (.., .., 128, 1)      COPY MATERIALIZED
+```
+
+Megatron's QKV projection writes `[sq, b, ng, (np/ng + 2) * hn]` -- each group's k and v
+head sit *between* consecutive groups' q heads. Merging the group axis with the head axis
+therefore requires the group stride to equal `(np/ng) * hn`; it equals
+`(np/ng + 2) * hn`. For Qwen3-30B that is **1024 required against 1280 actual**, so
+`Tensor.reshape` cannot return a view and silently copies the whole query instead.
+
+### Why four attempts missed it
+
+All four tested *the split*: `SplitAlongDim` against `torch.split` (`u1qkvsplit`, exactly
+neutral), then three `copy_trace` arms. The neutral split result was read as "the copy is
+elsewhere", when it was itself the answer -- both split branches feed the same reshape, so
+of course they measured the same. The one line never questioned was the one carrying a
+comment that explained it as a shape change.
+
+> **Lesson.** A layout claim is decidable from strides alone, and `reshape` reports a copy
+> as silently as it reports a view. When a profile shows a copy the size of a known
+> tensor, walk the *strides* of every reshape/view/permute between that tensor's producer
+> and its consumer before instrumenting anything. Four GPU sessions guessed at this; one
+> CPU-only `python3 -c` settled it.
+
+### The fix is free because the norm already pays for the write
+
+The fused q/k norm allocates its output anyway, so it can repack on the way through: read
+the query with the two strides the grouped layout needs (one per group, one per head
+inside a group) and write the contiguous `[sq, b, np, hn]` result the rest of attention
+wants. Same values in the same order, so the result is **bit-identical** -- the right
+acceptance bar here, because a head-permutation bug would produce individually plausible
+values in every head and sail past a tolerance check.
+
+| | reshape + norm | grouped norm |
+|---|---:|---:|
+| kernel, 256 tokens (graph replay) | 12.30 us | **8.22 us** |
+| launches per layer | 2 | **1** |
+| per step, 48 layers | — | **0.196 ms saved** |
+
+### QWEN-043 — grouped-read q/k norm: **+1.5%**
+
+Four alternating arms on one node, so node drift shows up as base-to-base spread:
+
+| Arm | Gates | Steady-state tok/s |
+|---|---|---:|
+| `h2base` | standing set | 29,828 |
+| `h3grp` | `+MCORE_GROUPED_QK_NORM=1` | 30,312 |
+| `h4base` | standing set | 29,858 |
+| `h5grp` | `+MCORE_GROUPED_QK_NORM=1` | 30,284 |
+
+Base-to-base spread **0.10%**, so the effect is ~15x the noise. Pooled
+**29,845 -> 30,298 tok/s (+1.52%)**, i.e. 8.58 -> 8.45 ms/step -- 0.13 ms of the
+microbenchmark's 0.196 ms lands end-to-end. Generated text is identical character for
+character, as bit-exactness requires. Shipped behind `MCORE_GROUPED_QK_NORM=1`; requires
+the fused q/k norm, and declines when the query needs the tensor-parallel head slice.
+
+**Status: 30,298 against vLLM's 33,994.5 = 89.1% of vLLM** (from 87.9% at session start,
+65.9% at the campaign's start). Remaining gap 0.90 ms/step.
+
+
+### The trace confirms it, and nothing else moved
+
+Diffing the fresh trace against the previous one, same anchor and window, is the cleanest
+attribution in this campaign:
+
+| bucket | before | after | delta |
+|---|---:|---:|---:|
+| elementwise / copy | 0.164 ms, 59 launches | **0.042 ms, 11 launches** | **-0.122 ms, -48** |
+| every other bucket | — | — | within +/-0.012 ms, 0 launches |
+| TOTAL | 5.923 ms, 963 | 5.804 ms, 916 | -0.120 ms, -48 |
+
+Exactly one launch per layer left the copy bucket and nothing else changed, which also
+re-validates the window: the buckets the change cannot touch held still, the check
+`union_window.py` demands after the 27%-seqlen-skew incident. The 0.122 ms of device time
+matches the 0.13 ms measured end-to-end.
+
+### The last mcore-only bucket, attributed
+
+`splitKreduce` is the one category vLLM has none of (82 launches, 0.173 ms/step). Its trace
+neighbours name both parents:
+
+| n/step | parent GEMM | successor |
+|---:|---|---|
+| 48 | `nvjet_..._2cta_h_bz_splitK_TNT` / `..._4x1_v_bz_splitK_TNN` | `_softmax_topk_kernel` |
+| 34 | `nvjet_..._2cta_h_bz_splitK_TNT` | `_fused_add_rmsnorm_kernel` |
+
+So it is the **router GEMM** (one per layer, exactly 48) and the **attention output
+projection** (34 of 48 layers; the rest pick a non-splitK algorithm). The router case is
+not a mis-tuned heuristic: at M=256, K=2048, N=128 the output is a couple of tiles, so
+splitting K is the only way cuBLASLt gets parallelism, and the reduce is the price of it.
+That reframes the target -- not "stop cuBLASLt from splitting K", but "fuse the router",
+which would collapse GEMM + splitK reduce + softmax-topk + padding mask (4 launches/layer,
+~192 total) into one. A fused router must beat GEMM+reduce on its own terms, so it needs a
+microbenchmark before any integration: 256 CTAs each reading the whole 512 KB weight is
+128 MB of L2 traffic, and blocking tokens instead leaves 4 CTAs on 148 SMs.
+
+### QWEN-044 — eight rows per CTA in the q/k norm: **+0.35%**
+
+The grouped norm moves ~4.5 MB in 8.22 us -- about 570 GB/s on a GB200, because one CTA
+per 128-wide row means 9,216 single-warp CTAs. A rows x warps sweep, keeping only
+bit-exact candidates:
+
+| rows/CTA | warps | us | GB/s | vs 1x1 |
+|---:|---:|---:|---:|---:|
+| 1 | 1 | 8.21 | 574 | 1.00x |
+| 2 | 2 | 6.17 | 765 | 1.33x |
+| 4 | 4 | 6.15 | 767 | 1.34x |
+| **8** | **8** | **4.12** | **1146** | **2.00x** |
+
+In-tree the same shape measures **6.15 us**, not 4.12 -- a 2 us gap between the harness
+kernel and the shipped one at identical rows and warps that is **still unexplained** after
+three hypotheses, each tested and each measuring 6.15 us unchanged:
+
+| Hypothesis | Why it was plausible | Result |
+|---|---|---|
+| Runtime output row stride blocks store vectorization | the harness hardcoded `HN`, the kernel took a stride argument | rejected, 6.15 us |
+| `where(is_q, rows, 0)` in the store address hides contiguity | the harness addressed stores off the raw row index | rejected, 6.15 us |
+| Two separate load address arrays instead of one shared | the harness built a single `where`-selected offset array | rejected, 6.15 us |
+
+**Closed in session 20: there is no gap.** The PTX comparison this pointed to was run
+(`dev/moe_fused/harness_qknorm_ptx.py`) and measured the shipped kernel and the harness
+kernel at **4.12 us each, ratio 1.00x** -- same answer for q and k, 21 registers, no
+spills, `.v2` vectorized loads and stores. The shipped kernel had already reached the
+harness number; the 6.15 us readings were stale, taken before the store-stride fix landed
+and then carried forward as if current. The three hypotheses above were each rejected for
+the right reason: every one of them was measuring a kernel that was already fast.
+
+The lesson is measurement hygiene, not Triton. A number that survives three
+disconfirmations without moving is more likely stale than robust, and re-measuring the
+baseline is cheaper than the next hypothesis. Nothing left to recover -- item closed.
+
+End-to-end, both arms from the same file so the launch shape is the only variable:
+1x1 controls **30,341 / 30,399** against 8x8 **30,482** tok/s, i.e. **+0.35%** on a
+control-to-control spread of 0.19%. Note the microbenchmark predicted 1.17%
+(2.06 us x 48 layers on an 8.44 ms step) and a third of that landed -- a reminder that a
+kernel-level win on a non-critical-path kernel is an upper bound, not a forecast.
+
+### QWEN-045 — fusing the router GEMM: **-2.37%, rejected**
+
+The router chain is four launches per layer: gating GEMM, a cuBLASLt splitK reduce (the
+logits have to reach memory before top-k can read them), fused softmax+topk, and the
+padding mask. `kernel_neighbors.py` attributed 48 of the 82 splitK reduces per step to
+this GEMM, so collapsing all four into one Triton kernel that keeps the logit tile in
+registers looked like the largest single launch-count win available.
+
+The microbenchmark endorsed it. Sweeping BLOCK_M x BLOCK_K x warps at the decode shape,
+keeping only configs whose expert sets matched exactly:
+
+| BLOCK_M | BLOCK_K | warps | us | vs reference |
+|---:|---:|---:|---:|---:|
+| 32 | 128 | 8 | 16.41 | 0.94x |
+| 16 | 128 | 4 | 12.68 | 1.21x |
+| **16** | **256** | **4** | **12.31** | **1.25x** |
+
+Expert sets bit-exact, probabilities within 7.45e-09, and the folded padding mask correct
+(200 real rows, the other 56 getting -1). Against the reference's 15.34 us that is
+0.146 ms/step, ~1.7% of an 8.35 ms step. The winning shape is a *narrow* BLOCK_M with the
+widest K tile -- it maximises CTA count, and the whole-weight read each CTA does is then
+what hides the K loop. Note the in-tree defaults were initially the 0.94x config, which
+would have tested a kernel slower than baseline; they were corrected before the A/B.
+
+End to end it lost, consistently, in both replicate pairs:
+
+| arm | tok/s |
+|---|---:|
+| control | 30,689.4 |
+| fused router | 29,981.5 |
+| control | 30,697.5 |
+| fused router | 29,951.2 |
+
+**-2.37%** on a control-to-control spread of 8 tok/s. The sign is opposite to the
+prediction and the magnitude is larger, so this is not noise and not a tuning problem.
+
+The mechanism worth carrying forward: the four launches it replaced were not serial dead
+time. cuBLASLt's GEMM and its splitK reduce overlap with neighbouring kernels inside the
+CUDA graph, whereas a 16-CTA Triton kernel occupies few SMs *and* forces every CTA to
+stream the full weight matrix, which evicts what its neighbours are reading. Isolated
+device time credits the fused kernel for work it removed from the critical path only in
+a benchmark where nothing else was running.
+
+**Rule this establishes:** an isolated-kernel win does not transfer when the kernel it
+replaces is one that overlaps well. Before fusing across a cuBLAS call, measure the
+*ablation* ceiling (delete the work and run e2e) rather than the replacement's device
+time -- the ablation prices the critical path, the microbenchmark prices the kernel.
+Retained behind `MCORE_FUSED_ROUTER=0`.
+
+### QWEN-046 — the padding mask: **+1.02% available, fusion not yet working**
+
+Applying the rule from QWEN-045 to the cheapest member of the router chain.
+`mask_routing_padding` writes -1 into every topk slot of the CUDA-graph padding rows so
+those tokens route to no expert; it is one launch per layer per step (48/step) over a
+256x8 int64 tensor, which is almost entirely launch overhead. Ablating it outright
+(`MCORE_ABLATE_ROUTE_MASK=1`, correctness-breaking by construction, valid only as a
+ceiling) priced the critical path directly:
+
+| arm | tok/s |
+|---|---:|
+| control | 30,662.5 |
+| mask ablated | 30,965.1 |
+| control | 30,661.0 |
+| mask ablated | 30,983.4 |
+
+**+1.02%** on a control-to-control spread of 1.5 tok/s -- among the tightest replicate
+pairs measured in this project, and a lower bound besides: skipping the mask lets padding
+rows route to real experts, which if anything *adds* expert GEMM work.
+
+The fusion target is the router's `_softmax_topk_kernel`, which is one CTA per token and
+already stores that token's index row, so the sentinel is a scalar compare and a select
+with no extra launch. It was implemented (module-level publish of the context's
+`int32[1]` count, `MASK_PADDING` constexpr in the kernel, and a dispatcher skip keyed off
+a tag the router leaves on the tensor it masked) and it **hung in warmup with the gate
+off**, which localises the fault to the always-on parts rather than to the masking logic.
+Reverting the three files reproduced the baseline to within 1 tok/s (30,661.9 against
+30,662.5 and 30,661.0), so the hang is attributable to those edits alone.
+
+Design, suspects, and a cheapest-first diagnostic ladder are written up in
+`dev/moe_fused/NOTES-route-mask-fusion.md` so the next attempt starts from the hang
+rather than from the design. Leading suspect is the kernel signature change itself: it is
+the only always-on edit that alters generated code, and if `tl.where(False, -1, best_idx)`
+fails to fold, every row gets -1 and the NVLS all-gather-v barrier can deadlock on
+rank-divergent counts. Unmeasured guess, listed first in the ladder.
+
+### Session 20 status
+
+| | tok/s | ms/step | vs vLLM |
+|---|---:|---:|---:|
+| vLLM DP4+EP (`VLLM-BASELINE`) | 33,994.5 | 7.53 | — |
+| **mcore, current best** | **30,662–30,697** | **8.35** | **90.2%** |
+| mcore, with the mask ablated (not shippable) | 30,974 | 8.27 | 91.1% |
+| mcore at session-2 start | 22,398.9 | 11.71 | 65.9% |
+
+Session 20 added **no throughput**: both candidates were rejected, one on measurement
+(-2.37%) and one on a hang. The code is unchanged from session 19; the higher number
+against session 19's recorded 30,482 is node-and-day drift, not a code change, measured
+across five controls in one job (30,689 / 30,697 / 30,662 / 30,661 / 30,662).
+
+What session 20 did produce, all of which outlives it:
+
+- A priced target: **+1.02%** sitting in the padding mask, with the ceiling measured
+  rather than estimated, and the implementation already designed and written up.
+- A rule that would have saved this session's larger experiment (QWEN-045): price the
+  ablation ceiling before fusing across a well-overlapped cuBLAS call.
+- One closed open item (QWEN-044's phantom 2 us) and one retired measurement habit.
+- **14 hours of queue time recovered.** Two jobs sat `PENDING (Priority)` for 14 h and
+  7 h with 315 nodes idle, purely because the sbatch template omitted `--qos`: the
+  default `normal` is priority 100 against a queue head near 350k. Resubmitted under
+  `--qos=interactive` (priority 700, <=4 nodes) and `--qos=short` (priority 200, <=2 h),
+  both started within seconds. Every job template in `skills/` now sets `--qos`, and
+  `skills/run-qwen-model/SKILL.md` carries the diagnostic: if nodes are idle and
+  `squeue -j <id> -o '%Q'` is far below the head of `squeue -p batch -t PD -S -Q`, it is
+  QOS and not contention.
+
+### Session 19 status
+
+| | tok/s | ms/step | vs vLLM |
+|---|---:|---:|---:|
+| vLLM DP4+EP (`VLLM-BASELINE`) | 33,994.5 | 7.53 | — |
+| **mcore, current best** (`hftune`) | **30,482** | **8.40** | **89.7%** |
+| mcore at session-19 start (`y2pdl`) | 29,898 | 8.56 | 87.9% |
+| mcore at session-2 start | 22,398.9 | 11.71 | 65.9% |
+
+Session 19: **+1.95%** from two changes to one kernel, both bit-exact. Remaining gap
+0.87 ms/step.
+
+**Where the remaining gap is not.** Per-launch, mcore is now at or better than vLLM in
+every functional bucket, including attention and the expert GEMM. The residue is
+launch count (916 against 810) and packing: the overlap ratio is 1.008x against vLLM's
+1.050x. And the >100 us gap band is *not* the lever it looks like -- mcore shows
+0.893 ms/step there against vLLM's 2.727 ms/step in its own trace, so that band is
+dominated by profiler-inflated host work on both sides and cannot be compared across
+traces captured with different `--cuda-graph-trace` settings.
+
 
 ## Optimization rules
 

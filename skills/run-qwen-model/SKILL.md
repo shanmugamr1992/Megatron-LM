@@ -42,6 +42,50 @@ cog ensure-env --repo "$COG_MEGATRON_REPO" \
 
 Never download checkpoints. If either path is missing, ask the user.
 
+## If a cog command hangs, switch to `sbatch` after the second attempt
+
+These runs are long enough that a stuck launch is expensive. Every cog command
+that touches your code syncs the workspace first; when that sync hangs there is
+no job ID and no Slurm log, so it is indistinguishable from a slow start except
+by the missing `job_id`.
+
+> **Two strikes, then hand-write the job.** After the second consecutive hang
+> or broken pipe from the same client, stop retrying and submit `sbatch`
+> directly against a tree staged on lustre. On the rebase measurement this
+> converted a day of failed cog attempts into a completed benchmark in under 7
+> minutes. Full recipe — image path via `cog profile` (local-only, so it still
+> works), staging to a fresh directory, container mounts, venv activation — is
+> in `skills/cog-setup-and-help/SKILL.md`, section "Escape hatch: when
+> workspace sync hangs".
+
+Three rules for any directly-submitted job here, all learned the hard way:
+
+- **Always pass an explicit `--qos`.** Omitting it takes the default `normal`
+  (priority 100) and buries you behind a queue whose head sits near 350k, even
+  when hundreds of nodes are idle: two jobs submitted without it sat `PENDING
+  (Priority)` for 14 hours and 7 hours, then both started *within seconds* of
+  resubmission under a correct QOS. Pick by walltime and node count:
+  `--qos=interactive` (priority 700, ≤4 nodes) for single-node debug and
+  microbenchmark jobs, `--qos=short` (priority 200, ≤2 h, ≤64 nodes) for
+  anything up to two hours. Check your grants with
+  `sacctmgr -nP show assoc user=$USER format=Account,QOS` and the limits with
+  `sacctmgr -nP show qos format=Name,Priority,MaxWall,MaxTRESPU`. Diagnose a
+  stalled job by comparing `squeue -j <id> -o '%Q'` against
+  `squeue -p batch -t PD -S -Q -o '%.8Q' -h | head`; if idle nodes exist and
+  your number is far below the head, it is QOS, not contention.
+- **Gate the allocation on an `os.path.isfile` filesystem health check** over a
+  few of your changed files plus something deep in the shared venv, and `exit`
+  before the model load if any are unreadable. A node with a broken Lustre
+  client lists files it cannot open, and a 4×GB200 allocation is far too
+  expensive to discover that after checkpoint load.
+- **A cascade of `ModuleNotFoundError` across unrelated packages is a bad node,
+  not a bad venv.** Exclude it (`--exclude=<node>`) and resubmit; do not
+  pip-install overlay copies to work around it.
+
+`dev/moe_fused/rebased12.sbatch` is a working instance of this pattern if it is
+still present in your tree — but it is untracked, so treat the cog skill's
+inlined template as the source of truth.
+
 ## 1. Megatron-Core inference
 
 Runs `examples.inference.launch_inference_server` with

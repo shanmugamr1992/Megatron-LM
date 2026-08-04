@@ -34,6 +34,7 @@ ssh -o BatchMode=yes "$COG_SSH_HOST" "mkdir -p '$RUN_DIR'; cat > '$REMOTE_SCRIPT
 #SBATCH --job-name=$EXPERIMENT_ID
 #SBATCH --account=${COG_RUNTIME_ACCOUNT}
 #SBATCH --partition=${COG_BATCH_PARTITION}
+#SBATCH --qos=${SLURM_QOS:-short}
 #SBATCH --nodes=1
 #SBATCH --ntasks-per-node=1
 #SBATCH --gres=gpu:4
