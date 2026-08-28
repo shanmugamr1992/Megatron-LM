@@ -69,3 +69,8 @@ products:
       - environment: [dev]
         scope: [mr, mr-github]
         platforms: [dgx_gb200]
+  - test_case: [hybrid_gdp_dynamic_inference_tp1_pp1_dp4_800m_chunked_prefill]
+    products:
+      - environment: [dev]
+        scope: [mr, mr-github]
+        platforms: [dgx_gb200]
