@@ -87,6 +87,9 @@ except ImportError:
 
 _TE_CONFIG_TYPE_KEY = "transformer_engine_config_type"
 _EXPERT_PARAMETER_NAME_PATTERN = re.compile(r"(weight|bias)\d*")
+# GEMM bias parameters ("bias", or "bias0".."biasN" on a grouped linear). Deliberately excludes
+# names like "layer_norm_bias", which are not sized off out_features.
+_BIAS_NAME_PATTERN = re.compile(r"bias\d*")
 
 
 def _set_expert_parameter_attributes(
@@ -482,11 +485,13 @@ def _gtp_restore_presharded_bias(module, gtp_ctx, is_grouped=False):
     bias_names = getattr(module, "bias_names", None)
     if not bias_names:
         bias_names = [f"bias{idx}" for idx in range(module.num_gemms)] if is_grouped else ["bias"]
+    # Only the GEMM biases; never a norm bias (``layer_norm_bias``), which is sized off
+    # in_features and is not affected by the out_features pre-shard.
+    bias_names = [name for name in bias_names if _BIAS_NAME_PATTERN.fullmatch(name)]
     for name in bias_names:
         bias = getattr(module, name, None)
         # Only touch a bias TE actually sized off the pre-sharded out_features. Anything else
-        # (a zero-length placeholder for bias=False, or a norm bias sized off in_features) is
-        # left alone.
+        # (a zero-length placeholder for bias=False) is left alone.
         if not isinstance(bias, Parameter) or bias.dim() != 1 or bias.numel() != shard_numel:
             continue
         restored = Parameter(
