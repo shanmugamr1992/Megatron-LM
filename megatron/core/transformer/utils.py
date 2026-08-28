@@ -161,8 +161,15 @@ def make_sharded_tensors_for_checkpoint(
         layer_key = f'{prefix}{layer_name}'
 
         if layer_name.endswith(extra_state_suffix):
-            # Compute replica_id when groups are provided
-            replica_id = (0, get_pg_rank(tp_group), get_pg_rank(dp_cp_group))
+            # Compute replica_id when groups are provided. An _extra_state blob is replicated
+            # across the gtp_remat axis, which dp_cp excludes, so fold gtp_rank in to keep the
+            # writer election unique (see fold_gtp_rank_into_replica_rank).
+            dp_replica_rank = get_pg_rank(dp_cp_group)
+            if HAVE_GTP:
+                from megatron.core.tensor_parallel.gtp_api import fold_gtp_rank_into_replica_rank
+
+                dp_replica_rank = fold_gtp_rank_into_replica_rank(dp_replica_rank)
+            replica_id = (0, get_pg_rank(tp_group), dp_replica_rank)
 
             sharded_state_dict[layer_key] = make_sharded_object_for_checkpoint(
                 tensor, layer_key, sharded_offsets, replica_id=replica_id

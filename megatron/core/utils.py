@@ -1083,9 +1083,18 @@ def make_tp_sharded_tensor_for_checkpoint(
         from megatron.core.fp8_utils import is_float8tensor
         from megatron.core.tensor_parallel.gtp_api import (
             dequantize_gtp_native_fp8,
+            fold_gtp_rank_into_replica_rank,
             gtp_replica_rank,
             is_gtp_param,
         )
+
+        if not is_gtp_param(tensor):
+            # GTP-replicated tensor (bias, norm weight): its gtp_remat peers hold the SAME data,
+            # but dp_cp excludes that axis, so without folding gtp_rank in they would all claim
+            # replica_id 0 and checkpoint validation would reject the duplicate writers.
+            dp_replica_id = fold_gtp_rank_into_replica_rank(
+                dp_replica_id, is_expert=not getattr(tensor, 'allreduce', True)
+            )
 
         if is_gtp_param(tensor):
             gtp_rank = get_pg_rank(tensor.group)
@@ -1193,6 +1202,15 @@ def make_sharded_tensor_for_checkpoint(tensor, key, prepend_offsets=(), replica_
         tensor = get_full_tensor_if_necessary(tensor)
         # Add FSDP sharding rank offsets.
         new_offsets.append((prepend_axis_num, dp_rank, dp_size))
+
+    if HAVE_GTP and not is_torch_fsdp2_param:
+        # Replicated across the gtp_remat axis too, which dp_cp excludes — fold gtp_rank in so a
+        # single rank is elected writer. See fold_gtp_rank_into_replica_rank.
+        from megatron.core.tensor_parallel.gtp_api import fold_gtp_rank_into_replica_rank
+
+        dp_replica_id = fold_gtp_rank_into_replica_rank(
+            dp_replica_id, is_expert=not getattr(tensor, 'allreduce', True)
+        )
 
     if replica_id is None:
         replica_id = (0, get_pg_rank(tp_group), dp_replica_id)

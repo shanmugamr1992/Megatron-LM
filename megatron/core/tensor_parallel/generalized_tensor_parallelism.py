@@ -2691,6 +2691,43 @@ def gtp_replica_rank(param, explicit_group=None):
     )
 
 
+def fold_gtp_rank_into_replica_rank(dp_replica_rank, *, is_expert=False):
+    """Fold the gtp_remat rank into a GTP-REPLICATED tensor's DP replica coordinate.
+
+    A tensor that is NOT GTP-sharded — a norm weight, a bias, an ``_extra_state`` blob — is held
+    identically by every gtp_remat peer, so those peers are replicas of one another. But the
+    ``dp_cp`` group that checkpointing derives ``replica_id`` from deliberately EXCLUDES the
+    gtp_remat axis (it is the *replicate* group; see ``get_data_parallel_group(with_gtp_remat=)``),
+    so every gtp_remat peer reports the SAME rank. Distributed checkpointing then sees N ranks
+    claiming to be the main replica of one shard and fails validation with "Invalid access pattern
+    for ShardedTensor(...)".
+
+    Folding gtp_rank in restores the invariant that exactly one rank holds replica_id 0, which is
+    all the writer election needs. This mirrors what the GTP-aware branches of
+    :func:`make_sharded_tensors_for_checkpoint_with_gtp_remat` already do for replicated entries
+    inside a GTP-active module; this helper covers the modules that hold no GTP param at all
+    (``final_layernorm``, embeddings without GTP, attention ``_extra_state``), which never reach
+    that function.
+
+    GTP-SHARDED tensors must NOT use this: their gtp_remat peers hold *different* data, so their
+    writer is elected over the gtp_remat-excluded group by :func:`gtp_replica_rank`.
+
+    Returns ``dp_replica_rank`` unchanged when GTP is inactive, or when ``parallel_state`` is not
+    initialized (an explicit-process-group caller with no MPU globals to consult).
+    """
+    from megatron.core import parallel_state  # noqa: E402
+
+    if not parallel_state.is_initialized():
+        return dp_replica_rank
+    if is_expert:
+        group = parallel_state.get_expert_gtp_weight_remat_group(check_initialized=False)
+    else:
+        group = parallel_state.get_gtp_weight_remat_group(check_initialized=False)
+    if group is None or group.size() <= 1:
+        return dp_replica_rank
+    return dp_replica_rank * group.size() + group.rank()
+
+
 def make_sharded_tensors_for_checkpoint_with_gtp_remat(
     state_dict,
     prefix,
