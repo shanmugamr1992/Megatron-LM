@@ -714,6 +714,37 @@ def attach_gtp_to_presharded_module(
         new_weights.append(gtp_param)
     if is_grouped and new_weights:
         new_weights[0].weight_list = new_weights
+    _gtp_restore_replicated_bias(module, gtp_remat_group, pad_length, is_grouped=is_grouped)
+
+
+def _gtp_restore_replicated_bias(module, gtp_remat_group, pad_length, is_grouped=False):
+    """Restore the module's linear bias(es) to full size, replicated across the GTP group.
+
+    ``_gtp_pre_init`` passes TE a pre-sharded ``out_features`` so that TE builds the weight already
+    sharded; TE sizes the bias from that same value, so the bias comes out sharded as well. GTP
+    shards weights only, so this undoes that side effect.
+
+    Re-allocating zeros reproduces the values exactly because TE zero-initializes every linear bias
+    (``init_method_constant(0.0)``); a future non-zero bias init would need a gather instead.
+    """
+    # A packed bias has no per-gemm entries to re-allocate, so it would silently stay sharded.
+    assert not getattr(
+        module, "single_grouped_bias", False
+    ), f"GTP grouped module {type(module).__name__} requires single_grouped_bias=False."
+    # GroupedLinear does not declare bias_names; its biases are bias0..bias{num_gemms-1}.
+    bias_names = getattr(module, "bias_names", None)
+    if not bias_names:
+        bias_names = [f"bias{idx}" for idx in range(module.num_gemms)] if is_grouped else ["bias"]
+    gtp_remat_size = gtp_remat_group.size()
+    for name in bias_names:
+        bias = getattr(module, name, None)
+        # TE registers an empty plain tensor (not a Parameter) for the bias-free case.
+        if not isinstance(bias, torch.nn.Parameter) or bias.numel() == 0:
+            continue
+        # Resize in place: the Parameter keeps its identity, so its module registration and the
+        # attributes DDP / the optimizer / checkpointing read off it all survive untouched.
+        with torch.no_grad():
+            bias.data = bias.new_zeros(bias.shape[0] * gtp_remat_size - pad_length)
 
 
 # Cache of dynamic ``GTP_<Fp8TensorClass>`` subclasses, keyed by the FP8 base class.
